@@ -75,8 +75,6 @@ void setup() {
   Serial1.begin(115200, SERIAL_8N1, RXD, TXD);
   Serial1.setRxBufferSize(SERIAL_BUFFER_SIZE);
   while (Serial1.available()) Serial1.read();
-  modemPowerCycle();
-  while (Serial1.available()) Serial1.read();
   initConcatBuffer();
   loadConfig();
   configValid = isConfigValid();
@@ -151,6 +149,7 @@ void setup() {
     }
   });
   server.begin();
+  gWebServerReady = true;
   logCaptureLn("HTTP服务器已启动");
 
   // ---- mDNS：可用 http://sms.local 访问，免记 IP ----
@@ -164,8 +163,7 @@ void setup() {
   applyTimeConfig();
   int ntpRetry = 0;
   while (time(nullptr) < 100000 && ntpRetry < 100) {
-    delay(1);
-    server.handleClient();
+    pumpWebDuringWait();
     ntpRetry++;
   }
   if (time(nullptr) >= 100000) {
@@ -183,6 +181,8 @@ void setup() {
   digitalWrite(LED_BUILTIN, LOW);
 
   // ---- 模组初始化（较慢，但网页已可访问；使短信收发尽早就绪） ----
+  modemPowerCycle();
+  while (Serial1.available()) Serial1.read();
   modemInit();
 
   // ---- 开机补收 SIM 中暂存的短信（断电期间到达的消息不丢）----
@@ -257,12 +257,13 @@ void loop() {
   if (Serial.available()) Serial1.write(Serial.read());
   checkSerial1URC();
   smsReceiveWatchdogTick(); // 收到 +CMTI 后优先按索引读取，避免其它 AT 操作抢串口
-  processPingJob();       // 诊断蜂窝 HTTP payload 后台执行，避免 /ping 请求占住 WebServer
   processForwardQueue();   // 接收/转发解耦：每帧最多转发一条(仅规则判定+入队，无网络，开销极小)
   processOutgoingSmsQueue(); // 网页发短信异步出队，避免HTTP请求阻塞等待AT+CMGS
+  processPingJob();       // 诊断蜂窝 HTTP payload 后台执行；排在短信收发后，避免抢前台短信
   // 推送/邮件/测试推送已移到后台 worker 线程(pushWorkerTask)，不再占用 loop —— 转发/邮件不阻塞收信与网页。
   wifiEnsureConnected();   // WiFi 掉线兜底重连
   modemHealthTick();       // 模组健康探测/自动恢复
+  modemIdentityTick();     // 开机后一次性补采样身份信息，分帧执行，不挡网页/短信
   signalSampleTick();      // 4G 信号采样(CSQ 高频/详情低频，与接收轮询解耦防长阻塞)
   heapGuardTick();         // 低堆有序重启兜底
   keepAliveTick();         // 保号定时任务(绝对日期)

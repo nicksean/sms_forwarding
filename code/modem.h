@@ -9,7 +9,8 @@ void resetModule();
 void modemInit();
 void modemHealthTick();  // loop() 中按周期探测模组健康，连续失败自动断电恢复
 bool queryModemImei(String& imeiOut, String* rawResp = nullptr, unsigned long timeout = 2000); // 查询一次 IMEI，按常见命令顺序回退
-void sampleModemIdentity();  // 采样 IMEI / ICCID / 本机号码(开机一次)
+void requestModemIdentitySample(); // 安排开机一次性后台采样 IMEI/ICCID/IMSI/APN 等
+void modemIdentityTick();    // loop() 周期调用：身份信息分帧采样，不阻塞注册/补短信
 void saveModemIdentityCache(); // 把已查询到的 IMEI/ICCID 写入 NVS 缓存，首页可立即显示
 void sampleCellIp();         // 读取蜂窝 PDP IP(仅 dataEnabled)
 void sampleSignalDetail();   // 采样 RSRP/RSRQ/SINR/PCI/PLMN/TAC(周期)
@@ -26,6 +27,7 @@ void processOutgoingSmsQueue();
 int outgoingSmsQueueDepth();
 bool modemSerialTryBegin(const char* label);  // 自定义AT等待流程使用：进入独占串口区
 void modemSerialEnd();                        // 自定义AT等待流程使用：退出独占串口区
+bool modemAtQuietFor(unsigned long gapMs);    // 距上次 AT 事务结束是否已间隔足够久(后台调度节流)
 bool fetchCellularKeepAliveUrl(const String& url, unsigned long* bytesRead = nullptr,
                                int* httpStatus = nullptr); // PDP 已激活时通过模组蜂窝 HTTP GET 下载 payload
 

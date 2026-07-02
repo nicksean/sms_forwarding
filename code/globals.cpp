@@ -11,6 +11,7 @@ bool timeSynced = false;
 bool modemReady = false;
 bool apMode = false;
 volatile bool gInWebRequest = false;
+volatile bool gWebServerReady = false;
 volatile unsigned long smsRecvGuardUntil = 0;
 unsigned long lastWebRequestMs = 0;
 unsigned long lastPrintTime = 0;

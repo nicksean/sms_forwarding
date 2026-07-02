@@ -14,6 +14,11 @@ static int storedSmsIndexQueue[SMS_STORED_INDEX_QUEUE_MAX];
 static uint8_t storedSmsIndexHead = 0;
 static uint8_t storedSmsIndexCount = 0;
 static unsigned long nextStoredSmsProcessMs = 0;
+static bool forceWatchdogReassert = false;
+
+void requestSmsReceiveWatchdogReassert() {
+  forceWatchdogReassert = true;
+}
 
 static void enterPduWaitWindow(const char* reason) {
   if (reason && reason[0]) logCaptureLn(reason);
@@ -318,14 +323,17 @@ void processAdminCommand(const char* sender, const char* text) {
     // 否则与 worker 共用全局 smtp/ssl_client 并发会撕裂 TLS 会话(见 push.cpp 注释)。
     enqueueEmailNotification("重启命令已执行", "收到RESET命令，即将重启模组和ESP32...");
     unsigned long drainStart = millis();
-    while ((emailQueueDepth() > 0 || gSlowWorkBusy) && millis() - drainStart < 5000UL) delay(50);
+    while ((emailQueueDepth() > 0 || gSlowWorkBusy) && millis() - drainStart < 5000UL) {
+      pumpWebDuringWait();
+    }
 
     // 重启模组
     resetModule();
     
     // 重启ESP32
     logCaptureLn("正在重启ESP32...");
-    delay(1000);
+    unsigned long waitStart = millis();
+    while (millis() - waitStart < 1000UL) pumpWebDuringWait();
     ESP.restart();
   }
   else {
@@ -589,6 +597,8 @@ static bool processStoredSmsIndexQueue() {
 void smsReceiveWatchdogTick() {
   static unsigned long last = 0;
   static int pollCount = 0;
+  static uint8_t reassertStep = 0;       // 1=CMGF, 2=CNMI；拆成多帧，避免一次堆多条 AT
+  static bool periodicPollPending = false;
   if (!modemReady) return;
   if (smsRecvGuardUntil && millis() < smsRecvGuardUntil) return;  // 接收窗口内不发兜底AT，避免抢占正在直传的PDU
   if (processStoredSmsIndexQueue()) return;
@@ -600,14 +610,45 @@ void smsReceiveWatchdogTick() {
     nextStoredSmsProcessMs = millis() + SMS_STORED_BATCH_GAP_MS;
     return;
   }
+  if (reassertStep != 0) {
+    if (lastWebRequestMs != 0 && millis() - lastWebRequestMs < SLOW_WORK_WEB_GRACE_MS) return;
+    if (!modemAtQuietFor(MODEM_BACKGROUND_AT_GAP_MS)) return;
+    if (reassertStep == 1) {
+      sendATandWaitOK("AT+CMGF=0", 1000);            // 重申 PDU 模式
+      reassertStep = 2;
+    } else {
+      sendATandWaitOK("AT+CNMI=2,1,0,0,0", 1000);    // 重申存储通知模式(+CMTI)
+      reassertStep = 0;
+      periodicPollPending = true;
+    }
+    return;
+  }
+  if (periodicPollPending) {
+    if (lastWebRequestMs != 0 && millis() - lastWebRequestMs < SLOW_WORK_WEB_GRACE_MS) return;
+    if (!modemAtQuietFor(MODEM_BACKGROUND_AT_GAP_MS)) return;
+    periodicPollPending = false;
+    backfillStoredSms(false);  // 周期兜底接收 + 清存储
+    nextStoredSmsProcessMs = millis() + SMS_STORED_BATCH_GAP_MS;
+    return;
+  }
+  if (forceWatchdogReassert) {
+    if (lastWebRequestMs != 0 && millis() - lastWebRequestMs < SLOW_WORK_WEB_GRACE_MS) return;
+    if (!modemAtQuietFor(MODEM_BACKGROUND_AT_GAP_MS)) return;
+    forceWatchdogReassert = false;
+    reassertStep = 1;
+    last = millis();
+    return;
+  }
   if (millis() - last < SMS_POLL_INTERVAL_MS) return;
+  if (lastWebRequestMs != 0 && millis() - lastWebRequestMs < SLOW_WORK_WEB_GRACE_MS) return;
+  if (!modemAtQuietFor(MODEM_BACKGROUND_AT_GAP_MS)) return;
   last = millis();
   if ((pollCount % SMS_CNMI_REASSERT_EVERY) == 0) {
-    sendATandWaitOK("AT+CMGF=0", 1000);            // 重申 PDU 模式
-    sendATandWaitOK("AT+CNMI=2,1,0,0,0", 1000);    // 重申存储通知模式(+CMTI)，丢通知也可由 CMGL 兜底
+    reassertStep = 1;
+  } else {
+    periodicPollPending = true;
   }
   pollCount++;
-  backfillStoredSms(false);  // 兜底接收 + 清存储
   // 信号采样(CSQ/RSRP/...)已解耦到 signalSampleTick()，不再与 CMGL 串行堆叠造成长阻塞
 }
 
@@ -639,8 +680,7 @@ void drainPendingSmsUrc(unsigned long maxWaitMs) {
     bool hadBytes = Serial1.available() > 0;
     checkSerial1URC();
     if (!hadBytes && !smsUrcReceiving()) break;
-    delay(1);
-    yield();
+    pumpWebDuringWait();
   } while (millis() - start < maxWaitMs);
   expireSmsUrcWindow();
   if (serialLinePos > 0 && !Serial1.available() && (millis() - start) >= maxWaitMs) {

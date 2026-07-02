@@ -11,6 +11,7 @@ void checkConcatTimeout();
 bool concatBufferIdle();  // 是否无半成品长短信(供低堆有序重启判断)
 void backfillStoredSms(bool announce);  // 轮询/补收 SIM 暂存短信(转发+按索引删除)
 void smsReceiveWatchdogTick();           // 接收看门狗：兜底轮询 + 重申 CNMI(修复只能发不能收)
+void requestSmsReceiveWatchdogReassert(); // 启动短信模式设置失败时，后台尽快补设 CMGF/CNMI
 String readSerialLine(HardwareSerial& port);
 bool isHexString(const String& str);
 bool smsUrcReceiving();                   // 当前是否处在 +CMT/PDU 接收窗口或已有半行 URC

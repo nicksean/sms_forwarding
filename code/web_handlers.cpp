@@ -111,9 +111,9 @@ void logCaptureLn(const char* msg) {
   muxUnlock(gLogMux);
 }
 
-// 检查HTTP Basic认证
-bool checkAuth() {
-  lastWebRequestMs = millis();
+// 检查HTTP Basic认证。自动轮询类接口不刷新 lastWebRequestMs，避免首页开着时把后台 AT 任务长期饿住。
+bool checkAuth(bool markActivity) {
+  if (markActivity) lastWebRequestMs = millis();
   if (!server.authenticate(config.webUser.c_str(), config.webPass.c_str())) {
     server.requestAuthentication(BASIC_AUTH, "SMS Forwarding", "请输入管理员账号密码");
     return false;
@@ -475,8 +475,6 @@ struct PingJob {
 };
 static PingJob pingJob;
 
-static void pumpWebDuringBackgroundWait() { pumpWebDuringWait(); }  // 统一实现见 globals.h
-
 static bool keepAliveUrlValid(const String& url, String& err) {
   if (url.length() > 240) { err = "URL过长"; return false; }
   if (!(url.startsWith("http://") || url.startsWith("https://"))) {
@@ -500,7 +498,9 @@ static void finishPingJob(bool ok, const String& msg) {
 void processPingJob() {
   if (!pingJob.running) return;
   if (smsUrcReceiving()) return;
+  if (smsStoredWorkPending() || outgoingSmsQueueDepth() > 0 || forwardQueueDepth() > 0) return;
   if (millis() - pingJob.startedMs < SLOW_WORK_WEB_GRACE_MS) return;  // 先让 /ping 响应和紧随其后的刷新出去
+  if (!modemAtQuietFor(MODEM_FOREGROUND_AT_GAP_MS)) return;
 
   String url = pingJob.url;
   logCaptureLn(String("后台蜂窝HTTP payload 下载开始: ") + url);
@@ -548,9 +548,10 @@ void processPingJob() {
 
 // 处理蜂窝 HTTP payload 流量请求：只启动/查询后台任务，避免HTTP handler长时间占住WebServer
 void handlePing() {
-  if (!checkAuth()) return;
+  bool statusOnly = (server.arg("action") == "status");
+  if (!checkAuth(!statusOnly)) return;
 
-  if (server.arg("action") == "status") {
+  if (statusOnly) {
     String j = String("{\"running\":") + (pingJob.running ? "true" : "false") +
                ",\"done\":" + (pingJob.done ? String("true") : String("false")) +
                ",\"success\":" + (pingJob.success ? String("true") : String("false")) +
@@ -776,7 +777,7 @@ void handleSave() {
 // 流式返回，避免一次性拼出 ~10KB String；支持 ?since=<seq> 只回增量。
 // 响应: {"seq":<当前累计行号>,"lines":[...]}
 void handleLog() {
-  if (!checkAuth()) return;
+  if (!checkAuth(false)) return;
 
   unsigned long since = 0;
   if (server.hasArg("since")) since = strtoul(server.arg("since").c_str(), nullptr, 10);
@@ -811,7 +812,7 @@ void handleLog() {
 
 // 机器可读健康状态：供前端概览与外部监控读取
 void handleStatus() {
-  if (!checkAuth()) return;
+  if (!checkAuth(false)) return;
   server.sendHeader("Cache-Control", "no-store, max-age=0");
   server.sendHeader("Pragma", "no-cache");
   long up = millis() / 1000;
@@ -887,14 +888,15 @@ void handleStatus() {
 
 // 通道发送测试：用当前配置向指定通道发一条测试推送，便于配置后即时验证
 void handleTestPush() {
-  if (!checkAuth()) return;
+  bool statusOnly = (server.arg("action") == "status");
+  if (!checkAuth(!statusOnly)) return;
   int ch = server.arg("ch").toInt();
   if (ch < 0 || ch >= MAX_PUSH_CHANNELS) {
     server.send(400, "application/json", "{\"success\":false,\"message\":\"通道序号无效\"}");
     return;
   }
 
-  if (server.arg("action") == "status") {
+  if (statusOnly) {
     server.send(200, "application/json", testPushStatusJson((uint8_t)ch));
     return;
   }
@@ -1119,7 +1121,7 @@ static void applyConfigKey(const String& k, const String& v) {
   else if (k == "kaTarget") config.kaTarget = v;
   else if (k == "kaUrl") config.kaUrl = v.length() ? v : CELLULAR_KEEPALIVE_DEFAULT_URL;
   else if (k.startsWith("push") && k.length() > 5) {
-    int idx = k.charAt(4) - '0';  // ponytail: 单位数索引，依赖 MAX_PUSH_CHANNELS<10(=5)；超过需改多位解析
+    int idx = k.charAt(4) - '0';  // 单位数索引，依赖 MAX_PUSH_CHANNELS<10(=5)；超过需改多位解析
     if (idx >= 0 && idx < MAX_PUSH_CHANNELS) {
       String s = k.substring(5);
       PushChannel& ch = config.pushChannels[idx];
@@ -1193,7 +1195,7 @@ void handleOtaFinish() {
 // 收件箱：流式返回本地留存的最近短信(时间倒序)
 // 响应: [{"id":N,"recv":epoch,"sender":"..","ts":"..","text":"..","fwd":true},...]
 void handleMessages() {
-  if (!checkAuth()) return;
+  if (!checkAuth(false)) return;
   bool sentBox = (server.arg("box") == "sent");
   server.setContentLength(CONTENT_LENGTH_UNKNOWN);
   server.send(200, "application/json", "");
@@ -1253,8 +1255,8 @@ void handleDeleteMsg() {
 
 // 保号: action=status(默认) / run(立即执行) / reset(仅重置基准日)
 void handleKeepAlive() {
-  if (!checkAuth()) return;
   String action = server.arg("action");
+  if (!checkAuth(action != "status")) return;
   if (action == "run") {
     String msg;
     bool ok = enqueueKeepAliveRunNow(msg);
@@ -1389,9 +1391,9 @@ void handleWifi() {
   String action = server.arg("action");
   if (action == "restart") {
     logCaptureLn("网页端请求重启WiFi...");
-    server.send(200, "application/json", "{\"success\":true,\"message\":\"WiFi 正在重启，请等待约 5 秒后刷新页面\"}");
-    WiFi.disconnect(true);
-    delay(500);
+    server.send(200, "application/json", "{\"success\":true,\"message\":\"WiFi 已开始重连，状态会在首页自动更新\"}");
+    delay(120);  // 给响应一个很短的发出窗口，后续不在 handler 内长等重连
+    WiFi.disconnect(false);
     WiFi.setSleep(false);
     WiFi.setAutoReconnect(true);
     WiFi.setScanMethod(WIFI_FAST_SCAN);
@@ -1399,16 +1401,7 @@ void handleWifi() {
     String rp = config.wifiSsid.length() ? config.wifiPass : String(WIFI_PASS);
     WiFi.begin(rs.c_str(), rp.c_str());
     logCaptureLn(String("正在重新连接WiFi: " + rs));
-    unsigned long start = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - start < 15000) {
-      delay(50);
-      yield();  // 已响应浏览器，避免在HTTP handler内重入WebServer
-    }
-    if (WiFi.status() == WL_CONNECTED) {
-      logCaptureLn(String("WiFi 重连成功, IP: " + WiFi.localIP().toString()));
-    } else {
-      logCaptureLn("WiFi 重连失败，将在后台持续尝试");
-    }
+    // 不在 HTTP handler 内等待 15 秒；连接结果由 /status 与 wifiEnsureConnected() 后台更新。
   } else {
     server.send(200, "application/json", "{\"success\":false,\"message\":\"未知操作\"}");
   }

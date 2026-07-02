@@ -15,7 +15,7 @@ void logCaptureF(const char* fmt, ...);
 void logCaptureLn(const String& msg);
 void logCaptureLn(const char* msg);
 
-bool checkAuth();
+bool checkAuth(bool markActivity = true);
 void handleRoot();
 void handleToolsPage();
 void handleSave();

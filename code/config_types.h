@@ -114,6 +114,13 @@ struct Config {
 #define SMS_CMGD_TIMEOUT_MS      1500UL   // 删除单条暂存短信超时
 #define SIGNAL_FAST_INTERVAL_MS  30000UL  // 4G 信号条(CSQ)采样周期；避免频繁抢模组串口
 #define SIGNAL_DETAIL_INTERVAL_MS 120000UL // 详细信号(RSRP/RSRQ/SINR/PCI/TAC)低频采样，降低后台 AT 占用
+#define SIGNAL_FAST_FIRST_DELAY_MS 3000UL  // 开机就绪后尽快采一次 CSQ，后续再按正常周期
+#define SIGNAL_DETAIL_FIRST_DELAY_MS 8000UL // 详细信号首采样延后并拆帧，不阻塞开机补短信
+#define SIGNAL_DETAIL_STEP_GAP_MS 250UL    // 详细信号拆成多帧采样，每条 AT 间隔给 WebServer 喘息
+#define MODEM_IDENTITY_FIRST_DELAY_MS 1500UL // 开机后一次性后台补采样 IMEI/ICCID 等，不阻塞注册/补短信
+#define MODEM_IDENTITY_STEP_GAP_MS 200UL     // 身份信息每条 AT 间隔，避免连续占住 ML307 串口
+#define MODEM_BACKGROUND_AT_GAP_MS 300UL   // 后台 AT(信号/健康/兜底轮询)之间的最小间隔，匹配 ML307 吞吐
+#define MODEM_FOREGROUND_AT_GAP_MS 80UL    // 前台 AT(网页发短信/用户诊断)只留很短间隔，优先响应用户动作
 #define MODEM_HEALTH_FAIL_LIMIT  3        // 连续探测失败多少次触发自动断电恢复
 #define WIFI_CHECK_INTERVAL_MS   15000UL  // WiFi 掉线兜底检查周期(ms)
 #define REBOOT_MIN_UPTIME_MS     7200000UL // 每日定时重启所需的最小运行时长(2h>重启窗口1h)：防止重启后在同一小时内反复重启
@@ -122,6 +129,8 @@ struct Config {
 #define MODEM_POWERUP_MIN_MS     1500     // 上电最小安定延时；之后轮询 AT 探活，应答即提前结束(省 3-4s/开机)
 #define MODEM_INIT_AT_RETRIES    10       // modemInit AT 握手单轮重试次数
 #define MODEM_INIT_CMD_RETRIES   5        // modemInit 其它配置命令重试次数
+#define MODEM_INIT_SMS_CMD_RETRIES 2      // CNMI/CMGF 启动只快速尝试；失败交给接收看门狗后台补设
+#define MODEM_INIT_SMS_RETRY_GAP_MS 80UL  // CNMI/CMGF 启动重试间隔，避免开机网页被闪灯等待拖慢
 #define CELLULAR_KEEPALIVE_DEFAULT_URL "http://gg.incrafttime.top/api/payload?size=64342"
 #define CELLULAR_KEEPALIVE_MIN_BYTES   (48UL * 1024UL)  // 默认 payload 约 63KB；低于此值视为未达到保号流量
 #define CELLULAR_HTTP_TIMEOUT_MS       90000UL          // 蜂窝 HTTP 下载最长等待；含 DNS/HTTPS/漫游网络抖动
@@ -133,6 +142,8 @@ struct Config {
 // SLOW_WORK_WEB_GRACE_MS 仍保留：供 loop 线程上的保号/网页发短信/诊断HTTP 在网页活跃后短暂避让模组AT。
 #define SLOW_WORK_WEB_GRACE_MS   1500UL   // 刚处理过网页请求后，loop 上的模组类慢任务暂缓，给SPA留窗口
 #define SLOW_WORK_MAX_DEFER_MS   10000UL  // 但单个慢任务被避让的上限：超过即强制执行，防 SPA 持续轮询饿死保号/网页发短信
+#define OUT_SMS_WEB_GRACE_MS     250UL    // 网页发短信只等前端收到响应，不跟后台保号一样长时间避让
+#define OUT_SMS_MAX_DEFER_MS     2500UL   // 持续刷新时，网页发短信最多延迟这么久后强制发送
 #define TLS_MIN_FREE_HEAP        50000UL  // 发起 TLS(SMTP/HTTPS) 前要求的最小可分配堆(worker与网页并发，留余量)
 // 后台 worker 任务参数：栈给足(TLS/SMTP 握手较吃栈；现有代码在 8KB 的 loopTask 上已能跑通，10KB 留余量)。
 #define PUSH_WORKER_STACK        10240    // worker 任务栈字节数(按需调；可观察 uxTaskGetStackHighWaterMark)

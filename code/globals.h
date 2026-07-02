@@ -39,6 +39,7 @@ extern bool timeSynced;
 extern bool modemReady;
 extern bool apMode;                   // 是否处于配网热点(SoftAP)模式
 extern volatile bool gInWebRequest;   // true=正在HTTP请求处理栈内；此时AT函数不得再泵server.handleClient()(防WebServer重入崩溃)
+extern volatile bool gWebServerReady; // true=server.begin() 已完成；启动早期只 yield，不碰未启动的 WebServer
 extern volatile unsigned long smsRecvGuardUntil;  // >0且未到期=正在接收短信(+CMT后窗口)；loop内信号采样AT暂停，防清空Serial1冲掉PDU
 extern unsigned long lastWebRequestMs; // 最近一次进入HTTP handler的时间；慢任务据此避让，保持网页可响应
 extern unsigned long lastPrintTime;
@@ -85,7 +86,7 @@ static inline void muxUnlock(SemaphoreHandle_t m) { if (m) xSemaphoreGive(m); }
 // gInWebRequest 重入保护：已在 web handler 栈内则不再重入 WebServer，仅让出 CPU。
 // (modem/scheduler/web_handlers 三处此前各有一份同样实现，统一到此免漂移。)
 static inline void pumpWebDuringWait() {
-  if (gInWebRequest) { yield(); return; }
+  if (gInWebRequest || !gWebServerReady) { yield(); return; }
   gInWebRequest = true;
   server.handleClient();
   gInWebRequest = false;

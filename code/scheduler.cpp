@@ -18,8 +18,6 @@ struct KeepAliveJob {
 
 static KeepAliveJob kaJob;
 
-static void schedulerPumpWebDuringWait() { pumpWebDuringWait(); }  // 统一实现见 globals.h
-
 // 保号动作：激活数据连接 + 通过模组蜂窝 HTTP 下载 payload，再关闭 PDP 省流量。
 // 参考 gg-keeper：用带随机参数的 payload 下载制造真实蜂窝流量，URL 可在网页配置。
 static bool keepAliveHttpFetch() {
@@ -111,6 +109,8 @@ static void processKeepAliveJob() {
   if (lastWebRequestMs != 0 && millis() - lastWebRequestMs < SLOW_WORK_WEB_GRACE_MS &&
       millis() - kaJob.queuedMs < SLOW_WORK_MAX_DEFER_MS) return;
   if (smsUrcReceiving() || smsStoredWorkPending()) return;
+  if (forwardQueueDepth() > 0 || outgoingSmsQueueDepth() > 0 || gSlowWorkBusy) return;
+  if (!modemAtQuietFor(MODEM_BACKGROUND_AT_GAP_MS)) return;
   if (!modemReady) {
     kaJob.pending = false;
     kaJob.running = false;
@@ -188,7 +188,8 @@ void dailyTasksTick() {
         outgoingSmsQueueDepth() == 0 && emailQueueDepth() == 0) {
       rbLastDay = day;
       logCaptureLn("每日定时重启...");
-      delay(300);
+      unsigned long waitStart = millis();
+      while (millis() - waitStart < 300UL) pumpWebDuringWait();
       ESP.restart();
     }
   }

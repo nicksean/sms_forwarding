@@ -6,6 +6,7 @@
 #include <esp_system.h>
 
 static bool modemSerialBusy = false;
+static unsigned long lastModemAtEndMs = 0;
 
 bool modemSerialTryBegin(const char* label) {
   if (modemSerialBusy) {
@@ -17,7 +18,13 @@ bool modemSerialTryBegin(const char* label) {
 }
 
 void modemSerialEnd() {
+  lastModemAtEndMs = millis();
   modemSerialBusy = false;
+}
+
+bool modemAtQuietFor(unsigned long gapMs) {
+  if (modemSerialBusy) return false;
+  return lastModemAtEndMs == 0 || millis() - lastModemAtEndMs >= gapMs;
 }
 
 static bool beginModemSerialOp(const char* label) {
@@ -29,6 +36,27 @@ static void endModemSerialOp() {
 }
 
 static void pumpWebServerDuringWait() { pumpWebDuringWait(); }  // 统一实现见 globals.h
+
+static void waitWithWebPump(unsigned long ms) {
+  unsigned long start = millis();
+  while (millis() - start < ms) pumpWebServerDuringWait();
+}
+
+static bool initSmsModeCommand(const char* cmd, const char* okMsg, const char* retryMsg, const char* failMsg) {
+  for (int tries = 0; tries < MODEM_INIT_SMS_CMD_RETRIES; tries++) {
+    if (sendATandWaitOK(cmd, 1000)) {
+      logCaptureLn(okMsg);
+      return true;
+    }
+    if (tries + 1 < MODEM_INIT_SMS_CMD_RETRIES) {
+      logCaptureLn(retryMsg);
+      waitWithWebPump(MODEM_INIT_SMS_RETRY_GAP_MS);
+    }
+  }
+  logCaptureLn(failMsg);
+  requestSmsReceiveWatchdogReassert();
+  return false;
+}
 
 static bool drainSerial1PreservingSms(const char* label) {
   if (!Serial1.available()) return true;
@@ -58,10 +86,7 @@ static bool drainSerial1PreservingSms(const char* label) {
 
 // 发送AT命令并获取响应
 String sendATCommand(const char* cmd, unsigned long timeout) {
-  if (modemSerialBusy) {
-    logCaptureLn(String("模组串口正忙，暂缓操作: ") + cmd);
-    return "";
-  }
+  if (!beginModemSerialOp(cmd)) return "";
   static bool preDraining = false;
   if (!preDraining) {
     preDraining = true;
@@ -70,9 +95,9 @@ String sendATCommand(const char* cmd, unsigned long timeout) {
   }
   if (smsUrcReceiving()) {
     logCaptureLn(String("短信接收窗口未空闲，暂缓AT命令: ") + cmd);
+    endModemSerialOp();
     return "";
   }
-  if (!beginModemSerialOp(cmd)) return "";
   if (!drainSerial1PreservingSms(cmd)) {
     endModemSerialOp();
     return "";
@@ -93,6 +118,7 @@ String sendATCommand(const char* cmd, unsigned long timeout) {
           pumpWebServerDuringWait();  // web 栈内不重入，内部泵也标记HTTP栈，避免嵌套AT抢串口
         }
         endModemSerialOp();
+        if (resp.indexOf("OK") >= 0) lastModemOkMs = millis();
         processSmsUrcText(resp);
         return resp;
       }
@@ -106,28 +132,32 @@ String sendATCommand(const char* cmd, unsigned long timeout) {
 
 // 新增"模组断电重启"函数
 void modemPowerCycle() {
+  if (!beginModemSerialOp("模组断电重启")) return;
   pinMode(MODEM_EN_PIN, OUTPUT);
 
   logCaptureLn("EN 拉低：关闭模组");
   digitalWrite(MODEM_EN_PIN, LOW);
-  delay(MODEM_POWERDOWN_MS);  // 关机时间给够（按型号可调）
+  waitWithWebPump(MODEM_POWERDOWN_MS);  // 关机时间给够（按型号可调），同时保持网页可响应
 
   logCaptureLn("EN 拉高：开启模组");
   digitalWrite(MODEM_EN_PIN, HIGH);
   // 上电探活：最小安定延时后轮询 AT，模组应答即提前结束，最长仍不超过 MODEM_POWERUP_MS。
   // 省每次开机 3-4s（原固定等 6s，阻塞在 WiFi 之前）。
-  // ponytail: 极简上电探针(不泵 web、不判 ERROR)，故未复用 sendATCommand；MIN/上限为按型号校准旋钮——
-  //           过早发 AT 个别 ML307 变体会失败，换模组先调 MODEM_POWERUP_MIN_MS。
-  delay(MODEM_POWERUP_MIN_MS);
+  // 极简上电探针，不复用 sendATCommand：这里已持有串口锁，只需要探测 OK 并持续泵 Web。
+  // 过早发 AT 个别 ML307 变体会失败，换模组先调 MODEM_POWERUP_MIN_MS。
+  waitWithWebPump(MODEM_POWERUP_MIN_MS);
   unsigned long budget = (MODEM_POWERUP_MS > MODEM_POWERUP_MIN_MS) ? (MODEM_POWERUP_MS - MODEM_POWERUP_MIN_MS) : 0;
   for (unsigned long t0 = millis(); millis() - t0 < budget; ) {
     while (Serial1.available()) Serial1.read();
     Serial1.println("AT");
     String r;
-    for (unsigned long s = millis(); millis() - s < 250; )
+    for (unsigned long s = millis(); millis() - s < 250; ) {
       if (Serial1.available()) r += (char)Serial1.read();
+      pumpWebServerDuringWait();
+    }
     if (r.indexOf("OK") >= 0) { logCaptureLn("模组上电已应答，提前结束等待"); break; }
   }
+  endModemSerialOp();
 }
 
 // 重启模组（EN引脚断电重启 + 重新初始化）
@@ -170,6 +200,9 @@ void modemInit() {
   if (resp.indexOf("OK") >= 0) {
     String manufacturer = "未知", model = "未知", version = "未知";
     parseATI(resp, manufacturer, model, version);
+    if (manufacturer.length() && manufacturer != "未知") modemMfr = manufacturer;
+    if (model.length() && model != "未知") modemModel = model;
+    if (version.length() && version != "未知") modemFwVer = version;
     //这个模组这条命令有bug
     if (model == "ML307Y") need_set_CGACT = false;
   }
@@ -180,7 +213,7 @@ void modemInit() {
       if (config.apn.length() > 0)
         sendATandWaitOK(("AT+CGDCONT=1,\"IP\",\"" + config.apn + "\"").c_str(), 3000);
       int tries = 0;
-      while (!sendATandWaitOK("AT+CGACT=1,1", 10000) && tries < MODEM_INIT_CMD_RETRIES) {
+      while (tries < MODEM_INIT_CMD_RETRIES && !sendATandWaitOK("AT+CGACT=1,1", 10000)) {
         logCaptureLn("激活数据连接失败，重试...");
         blink_short();
         tries++;
@@ -188,7 +221,7 @@ void modemInit() {
       logCaptureLn("已按配置启用蜂窝数据(AT+CGACT=1,1)");
     } else {
       int tries = 0;
-      while (!sendATandWaitOK("AT+CGACT=0,1", 5000) && tries < MODEM_INIT_CMD_RETRIES) {
+      while (tries < MODEM_INIT_CMD_RETRIES && !sendATandWaitOK("AT+CGACT=0,1", 5000)) {
         logCaptureLn("设置CGACT失败，重试...");
         blink_short();
         tries++;
@@ -207,17 +240,15 @@ void modemInit() {
   }
   // mt=1：短信先落到 SM/MT 存储并发 +CMTI 通知；即使通知被 AT 事务打断，
   // 60s CMGL 兜底轮询也能捞回，避免 mt=2 直推 +CMT 在极端串口竞争下丢正文。
-  for (int tries = 0; tries < MODEM_INIT_CMD_RETRIES && !sendATandWaitOK("AT+CNMI=2,1,0,0,0", 1000); tries++) {
-    logCaptureLn("设置CNMI失败，重试...");
-    blink_short();
-  }
-  logCaptureLn("CNMI参数设置完成(存储通知模式)");
-  for (int tries = 0; tries < MODEM_INIT_CMD_RETRIES && !sendATandWaitOK("AT+CMGF=0", 1000); tries++) {
-    logCaptureLn("设置PDU模式失败，重试...");
-    blink_short();
-  }
-  logCaptureLn("PDU模式设置完成");
-  sampleModemIdentity();   // 启动只采样一次并写入 NVS；失败则沿用旧缓存/显示为空，不后台重试
+  initSmsModeCommand("AT+CNMI=2,1,0,0,0",
+                     "CNMI参数设置完成(存储通知模式)",
+                     "设置CNMI失败，快速重试...",
+                     "设置CNMI暂未成功，交给接收看门狗后台补设");
+  initSmsModeCommand("AT+CMGF=0",
+                     "PDU模式设置完成",
+                     "设置PDU模式失败，快速重试...",
+                     "设置PDU模式暂未成功，交给接收看门狗后台补设");
+  requestModemIdentitySample();  // 仅安排一次后台采样；不阻塞注册和开机补短信
   int ceregRetry = 0;
   while (!waitCEREG() && ceregRetry < 30) {
     logCaptureLn("等待网络注册...");
@@ -234,7 +265,7 @@ void modemInit() {
     int q2 = cops.indexOf('"', q1 + 1);
     if (q1 >= 0 && q2 > q1) modemOperator = cops.substring(q1 + 1, q2);
     if (config.operatorPlmn.length()) modemApplyOperator();  // 仅在用户显式锁定运营商时下发
-    sampleSignalDetail();    // RSRP/RSRQ/SINR/PCI/PLMN/TAC
+    // 详细信号采样交给 signalSampleTick() 分帧执行，避免开机补短信前继续占用串口。
     if (config.dataEnabled) sampleCellIp();
   } else {
     logCaptureLn("网络注册超时（无SIM卡或信号差），模组功能暂不可用");
@@ -266,61 +297,156 @@ bool queryModemImei(String& imeiOut, String* rawResp, unsigned long timeout) {
   return false;
 }
 
-// 采样 IMEI 与本机号码(开机一次，纯本地 AT，不产生流量)。
-void sampleModemIdentity() {
-  String oldImei = modemImei;
-  String oldIccid = modemIccid;
-  String foundImei;
-  if (queryModemImei(foundImei, nullptr, 2000)) modemImei = foundImei;
-  String n = sendATCommand("AT+CNUM", 2000);   // +CNUM: "","+86...",145 (常为空)
+static bool identitySampleQueued = false;
+static bool identitySampleDone = false;
+static uint8_t identityStep = 0;
+static uint8_t identityImeiCmdIndex = 0;
+static unsigned long identityNextStepMs = 0;
+static String identityOldImei;
+static String identityOldIccid;
+
+static void parseCnumIdentity(const String& n) {
   int c = n.indexOf("+CNUM:");
-  if (c >= 0) {
-    int q1 = n.indexOf('"', n.indexOf(',', c));  // 第二个字段是号码
-    int q2 = (q1 >= 0) ? n.indexOf('"', q1 + 1) : -1;
-    if (q1 >= 0 && q2 > q1 + 1) modemPhone = n.substring(q1 + 1, q2);
-  }
-  // ICCID：ML307 用 AT+MCCID(+MCCID:)，回退标准 AT+ICCID(+ICCID:)
-  String ic = sendATCommand("AT+MCCID", 2000);
+  if (c < 0) return;
+  int q1 = n.indexOf('"', n.indexOf(',', c));  // 第二个字段是号码
+  int q2 = (q1 >= 0) ? n.indexOf('"', q1 + 1) : -1;
+  if (q1 >= 0 && q2 > q1 + 1) modemPhone = n.substring(q1 + 1, q2);
+}
+
+static bool parseIccidIdentity(const String& ic) {
   int icp = ic.indexOf("+MCCID:");
-  if (icp < 0) { ic = sendATCommand("AT+ICCID", 2000); icp = ic.indexOf("+ICCID:"); }
-  if (icp >= 0) {
-    int st = ic.indexOf(':', icp) + 1;
-    String v = ic.substring(st); v.replace("\"", "");
-    int nl = v.indexOf('\r'); if (nl < 0) nl = v.indexOf('\n');
-    if (nl >= 0) v = v.substring(0, nl);
-    v.trim();
-    if (v.length() >= 15) modemIccid = v;
-  }
-  // IMSI：AT+CIMI 返回纯数字行(无前缀)，后跟 OK；逐行找 14-16 位纯数字，跳过命令回显与 OK
-  String im = sendATCommand("AT+CIMI", 2000);
+  if (icp < 0) icp = ic.indexOf("+ICCID:");
+  if (icp < 0) return false;
+  int st = ic.indexOf(':', icp) + 1;
+  String v = ic.substring(st);
+  v.replace("\"", "");
+  int nl = v.indexOf('\r');
+  if (nl < 0) nl = v.indexOf('\n');
+  if (nl >= 0) v = v.substring(0, nl);
+  v.trim();
+  if (v.length() < 15) return false;
+  modemIccid = v;
+  return true;
+}
+
+static void parseImsiIdentity(String im) {
   im.replace("\r", "\n");
   for (int from = 0; from < (int)im.length(); ) {
     int nl = im.indexOf('\n', from);
     String line = (nl < 0) ? im.substring(from) : im.substring(from, nl);
     line.trim();
     bool allDigit = (line.length() >= 14 && line.length() <= 16);
-    for (int k = 0; allDigit && k < (int)line.length(); k++) if (line[k] < '0' || line[k] > '9') allDigit = false;
-    if (allDigit) { modemImsi = line; break; }
-    if (nl < 0) break; from = nl + 1;
+    for (int k = 0; allDigit && k < (int)line.length(); k++) {
+      if (line[k] < '0' || line[k] > '9') allDigit = false;
+    }
+    if (allDigit) { modemImsi = line; return; }
+    if (nl < 0) break;
+    from = nl + 1;
   }
-  // APN：读 AT+CGDCONT? 上下文1 的第3字段(SIM 默认/已配置接入点)。+CGDCONT: 1,"IP","apn",...
-  String cg = sendATCommand("AT+CGDCONT?", 2000);
+}
+
+static void parseApnIdentity(const String& cg) {
   int cgp = cg.indexOf("+CGDCONT: 1,");
-  if (cgp >= 0) {
-    int q1 = cg.indexOf('"', cgp), q2 = cg.indexOf('"', q1 + 1);
-    int q3 = cg.indexOf('"', q2 + 1), q4 = cg.indexOf('"', q3 + 1);
-    if (q3 >= 0 && q4 > q3 + 1) modemApn = cg.substring(q3 + 1, q4);
+  if (cgp < 0) return;
+  int q1 = cg.indexOf('"', cgp), q2 = cg.indexOf('"', q1 + 1);
+  int q3 = cg.indexOf('"', q2 + 1), q4 = cg.indexOf('"', q3 + 1);
+  if (q3 >= 0 && q4 > q3 + 1) modemApn = cg.substring(q3 + 1, q4);
+}
+
+static void parseAtiIdentity(const String& ati) {
+  if (ati.indexOf("OK") < 0) return;
+  String mfr = "未知", model = "未知", ver = "未知";
+  parseATI(ati, mfr, model, ver);
+  if (mfr.length() && mfr != "未知") modemMfr = mfr;
+  if (model.length() && model != "未知") modemModel = model;
+  if (ver.length() && ver != "未知") modemFwVer = ver;
+}
+
+void requestModemIdentitySample() {
+  if (identitySampleDone || identitySampleQueued) return;
+  identitySampleQueued = true;
+  identityStep = 0;
+  identityImeiCmdIndex = 0;
+  identityNextStepMs = millis() + MODEM_IDENTITY_FIRST_DELAY_MS;
+}
+
+// 开机一次性后台采样身份信息，纯本地 AT，不产生蜂窝流量。
+// 每次 tick 最多一条 AT，网页轮询不会饿死它，短信/发信/保号忙时它会主动退后。
+void modemIdentityTick() {
+  if (!identitySampleQueued) return;
+  if (!modemReady && lastModemOkMs == 0) return;
+  if (smsUrcReceiving() || smsStoredWorkPending()) return;
+  if (lastWebRequestMs != 0 && millis() - lastWebRequestMs < SLOW_WORK_WEB_GRACE_MS) return;
+  if (gSlowWorkBusy || forwardQueueDepth() > 0 || emailQueueDepth() > 0 ||
+      outgoingSmsQueueDepth() > 0) return;
+  if (!modemAtQuietFor(MODEM_BACKGROUND_AT_GAP_MS)) return;
+
+  unsigned long now = millis();
+  if ((int32_t)(now - identityNextStepMs) < 0) return;
+
+  if (identityStep == 0) {
+    identityOldImei = modemImei;
+    identityOldIccid = modemIccid;
+    logCaptureLn("后台一次性补采样模组身份信息...");
+    identityStep = 1;
   }
-  // 模组制造商/型号/固件版本：ATI 一次取齐，复用 sms_logic.h::parseATI(与诊断"固件信息"一致)
-  String ati = sendATCommand("ATI", 2000);
-  if (ati.indexOf("OK") >= 0) {
-    String mfr = "未知", model = "未知", ver = "未知";
-    parseATI(ati, mfr, model, ver);
-    if (mfr.length()   && mfr != "未知")   modemMfr = mfr;
-    if (model.length() && model != "未知") modemModel = model;
-    if (ver.length()   && ver != "未知")   modemFwVer = ver;
+
+  static const char* imeiCmds[] = {"AT+CGSN=1", "AT+GSN=1", "AT+CGSN", "AT+GSN"};
+  if (identityStep == 1) {
+    if (modemImei.length() >= 14 || identityImeiCmdIndex >= sizeof(imeiCmds) / sizeof(imeiCmds[0])) {
+      identityStep = 2;
+    } else {
+      String resp = sendATCommand(imeiCmds[identityImeiCmdIndex], 1200);
+      String found = extractImei(resp);
+      if (found.length() > 0) modemImei = found;
+      identityImeiCmdIndex++;
+      identityNextStepMs = millis() + MODEM_IDENTITY_STEP_GAP_MS;
+      return;
+    }
   }
-  if (modemImei != oldImei || modemIccid != oldIccid) saveModemIdentityCache();
+
+  if (identityStep == 2) {
+    if (modemPhone.length() == 0) parseCnumIdentity(sendATCommand("AT+CNUM", 1200));
+    identityStep = 3;
+    identityNextStepMs = millis() + MODEM_IDENTITY_STEP_GAP_MS;
+    return;
+  }
+
+  if (identityStep == 3) {
+    bool got = parseIccidIdentity(sendATCommand("AT+MCCID", 1500));
+    identityStep = got || modemIccid.length() >= 15 ? 5 : 4;
+    identityNextStepMs = millis() + MODEM_IDENTITY_STEP_GAP_MS;
+    return;
+  }
+
+  if (identityStep == 4) {
+    parseIccidIdentity(sendATCommand("AT+ICCID", 1500));
+    identityStep = 5;
+    identityNextStepMs = millis() + MODEM_IDENTITY_STEP_GAP_MS;
+    return;
+  }
+
+  if (identityStep == 5) {
+    if (modemImsi.length() == 0) parseImsiIdentity(sendATCommand("AT+CIMI", 1500));
+    identityStep = 6;
+    identityNextStepMs = millis() + MODEM_IDENTITY_STEP_GAP_MS;
+    return;
+  }
+
+  if (identityStep == 6) {
+    if (modemApn.length() == 0) parseApnIdentity(sendATCommand("AT+CGDCONT?", 1500));
+    identityStep = 7;
+    identityNextStepMs = millis() + MODEM_IDENTITY_STEP_GAP_MS;
+    return;
+  }
+
+  if (identityStep == 7) {
+    if (modemModel.length() == 0 || modemFwVer.length() == 0) parseAtiIdentity(sendATCommand("ATI", 1500));
+    if (modemImei != identityOldImei || modemIccid != identityOldIccid) saveModemIdentityCache();
+    identitySampleQueued = false;
+    identitySampleDone = true;
+    logCaptureLn("模组身份信息后台采样完成");
+  }
 }
 
 void saveModemIdentityCache() {
@@ -349,58 +475,65 @@ void sampleCellIp() {
   }
 }
 
+static bool parseMuestatsCell(const String& r) {
+  int line = r.indexOf("\"scell\"");
+  if (line < 0) return false;
+  int eol = r.indexOf('\n', line); if (eol < 0) eol = r.length();
+  String ln = r.substring(line, eol);   // "scell",4,460,00,...
+  String parts[12]; int np = 0, from = 0;
+  while (np < 12) {
+    int comma = ln.indexOf(',', from);
+    if (comma < 0) { parts[np++] = ln.substring(from); break; }
+    parts[np++] = ln.substring(from, comma);
+    from = comma + 1;
+  }
+  // parts[0]="scell" parts[1]=rat parts[2]=mcc parts[3]=mnc parts[6]=pci parts[7]=rsrp parts[8]=rsrq parts[10]=sinr
+  if (np <= 10) return false;
+  long mcc = parts[2].toInt(), mnc = parts[3].toInt();
+  long pci = parts[6].toInt();
+  String prsrp = parts[7]; prsrp.trim();
+  String prsrq = parts[8]; prsrq.trim();
+  String psinr = parts[10]; psinr.trim();
+  if (parts[2].length() && parts[3].length()) {
+    char b[12]; snprintf(b, sizeof(b), "%ld%02ld", mcc, mnc); modemPlmn = b;
+  }
+  if (parts[6].length() && pci >= 0 && pci != 65535) modemPci = (int)pci;
+  if (prsrp.length()) { long v = prsrp.toInt(); if (v > -32768) modemRsrp = (int)(v / 10); }
+  if (prsrq.length()) { long v = prsrq.toInt(); if (v > -32768) modemRsrq = (int)(v / 10); }
+  if (psinr.length()) { long v = psinr.toInt(); if (v > -32768) modemSinr = (int)(v / 10); }
+  return true;
+}
+
+static void parseCesqSignal(const String& ceResp) {
+  int cei = ceResp.indexOf("+CESQ:");
+  if (cei < 0) return;
+  int e = ceResp.indexOf('\n', cei); if (e < 0) e = ceResp.length();
+  String l = ceResp.substring(cei, e);
+  int lc = l.lastIndexOf(',');
+  int pc = l.lastIndexOf(',', lc - 1);
+  if (lc >= 0) { int idx = l.substring(lc + 1).toInt(); if (idx >= 0 && idx <= 97) modemRsrp = idx - 141; }
+  if (pc >= 0 && lc > pc) { int idx = l.substring(pc + 1, lc).toInt(); if (idx >= 0 && idx <= 34) modemRsrq = idx / 2 - 20; }
+}
+
+static void parseCeregTac(const String& c) {
+  int ce = c.indexOf("+CEREG:");
+  if (ce < 0) return;
+  int q1 = c.indexOf('"', ce);
+  int q2 = (q1 >= 0) ? c.indexOf('"', q1 + 1) : -1;
+  if (q1 >= 0 && q2 > q1 + 1) modemTac = c.substring(q1 + 1, q2);
+}
+
 // 详细服务小区信息：ML307 AT+MUESTATS="cell"。RSRP/RSRQ/RSSI/SINR 为 0.1 单位需 /10。
 // scell 行: +MUESTATS: "scell",<rat>,<mcc>,<mnc>,<earfcn>,<offset>,<pci>,<rsrp>,<rsrq>,<rssi>,<sinr>[,<bw>]
 // TAC 不在此行 → 从 AT+CEREG? 的十六进制 <tac> 字段取。-32768 为无效哨兵。
 void sampleSignalDetail() {
   String r = sendATCommand("AT+MUESTATS=\"cell\"", 2000);
-  int line = r.indexOf("\"scell\"");
-  if (line >= 0) {
-    int eol = r.indexOf('\n', line); if (eol < 0) eol = r.length();
-    String ln = r.substring(line, eol);   // "scell",4,460,00,...
-    String parts[12]; int np = 0, from = 0;
-    while (np < 12) {
-      int comma = ln.indexOf(',', from);
-      if (comma < 0) { parts[np++] = ln.substring(from); break; }
-      parts[np++] = ln.substring(from, comma);
-      from = comma + 1;
-    }
-    // parts[0]="scell" parts[1]=rat parts[2]=mcc parts[3]=mnc parts[6]=pci parts[7]=rsrp parts[8]=rsrq parts[10]=sinr
-    if (np > 10) {
-      long mcc = parts[2].toInt(), mnc = parts[3].toInt();
-      long pci = parts[6].toInt();
-      String prsrp = parts[7]; prsrp.trim();
-      String prsrq = parts[8]; prsrq.trim();
-      String psinr = parts[10]; psinr.trim();
-      if (parts[2].length() && parts[3].length()) {
-        char b[12]; snprintf(b, sizeof(b), "%ld%02ld", mcc, mnc); modemPlmn = b;
-      }
-      if (parts[6].length() && pci >= 0 && pci != 65535) modemPci = (int)pci;
-      if (prsrp.length()) { long v = prsrp.toInt(); if (v > -32768) modemRsrp = (int)(v / 10); }
-      if (prsrq.length()) { long v = prsrq.toInt(); if (v > -32768) modemRsrq = (int)(v / 10); }
-      if (psinr.length()) { long v = psinr.toInt(); if (v > -32768) modemSinr = (int)(v / 10); }
-    }
-  } else {
+  if (!parseMuestatsCell(r)) {
     // 回退：标准 AT+CESQ 取 RSRP/RSRQ 索引并换算(无 SINR/PCI)
-    String ce = sendATCommand("AT+CESQ", 2000);
-    int cei = ce.indexOf("+CESQ:");
-    if (cei >= 0) {
-      int e = ce.indexOf('\n', cei); if (e < 0) e = ce.length();
-      String l = ce.substring(cei, e);
-      int lc = l.lastIndexOf(',');
-      int pc = l.lastIndexOf(',', lc - 1);
-      if (lc >= 0) { int idx = l.substring(lc + 1).toInt(); if (idx >= 0 && idx <= 97) modemRsrp = idx - 141; }
-      if (pc >= 0 && lc > pc) { int idx = l.substring(pc + 1, lc).toInt(); if (idx >= 0 && idx <= 34) modemRsrq = idx / 2 - 20; }
-    }
+    parseCesqSignal(sendATCommand("AT+CESQ", 2000));
   }
   // TAC：+CEREG: <n>,<stat>,"<tac>","<ci>",<AcT>
-  String c = sendATCommand("AT+CEREG?", 2000);
-  int ce = c.indexOf("+CEREG:");
-  if (ce >= 0) {
-    int q1 = c.indexOf('"', ce);
-    int q2 = (q1 >= 0) ? c.indexOf('"', q1 + 1) : -1;
-    if (q1 >= 0 && q2 > q1 + 1) modemTac = c.substring(q1 + 1, q2);
-  }
+  parseCeregTac(sendATCommand("AT+CEREG?", 2000));
 }
 
 // 信号采样调度(与 SMS 接收轮询解耦，避免一次 watchdog tick 串行堆叠多条 AT 造成 ~9s 长阻塞)：
@@ -409,12 +542,16 @@ void signalSampleTick() {
   if (!modemReady) return;
   if (smsRecvGuardUntil && millis() < smsRecvGuardUntil) return;  // 短信接收窗口内不采样，避免AT清缓冲冲掉URC
   if (smsStoredWorkPending()) return;
-  static unsigned long lastFast = 0, lastDetail = 0;
+  static unsigned long lastFast = 0, lastDetail = 0, nextDetailStepMs = 0;
+  static uint8_t detailStep = 0;  // 0=空闲, 1=MUESTATS, 2=CESQ回退, 3=CEREG/TAC
+  static bool detailNeedCesq = false;
   unsigned long now = millis();
   if (lastWebRequestMs != 0 && now - lastWebRequestMs < SLOW_WORK_WEB_GRACE_MS) return;
   if (gSlowWorkBusy || forwardQueueDepth() > 0 || emailQueueDepth() > 0 ||
       outgoingSmsQueueDepth() > 0) return;
-  if (now - lastFast >= SIGNAL_FAST_INTERVAL_MS) {
+  if (!modemAtQuietFor(MODEM_BACKGROUND_AT_GAP_MS)) return;
+  bool fastDue = (lastFast == 0) ? (now >= SIGNAL_FAST_FIRST_DELAY_MS) : (now - lastFast >= SIGNAL_FAST_INTERVAL_MS);
+  if (detailStep == 0 && fastDue) {
     lastFast = now;
     String csq = sendATCommand("AT+CSQ", 1500);
     int ci = csq.indexOf("+CSQ:");
@@ -426,10 +563,28 @@ void signalSampleTick() {
         modemBer = csq.substring(comma + 1).toInt();   // 逗号后即 <ber>，toInt 自动忽略尾部 \r\nOK
       }
     }
+    return;  // 每帧最多一条 AT，避免信号采样把网页排队时间拉长
   }
-  if (now - lastDetail >= SIGNAL_DETAIL_INTERVAL_MS) {
-    lastDetail = now;
-    sampleSignalDetail();
+  bool detailDue = (lastDetail == 0) ? (now >= SIGNAL_DETAIL_FIRST_DELAY_MS) : (now - lastDetail >= SIGNAL_DETAIL_INTERVAL_MS);
+  if (detailStep == 0 && detailDue) {
+    detailStep = 1;
+    detailNeedCesq = false;
+    nextDetailStepMs = now;
+  }
+  if (detailStep != 0 && (int32_t)(now - nextDetailStepMs) >= 0) {
+    if (detailStep == 1) {
+      String r = sendATCommand("AT+MUESTATS=\"cell\"", 2000);
+      detailNeedCesq = !parseMuestatsCell(r);
+      detailStep = detailNeedCesq ? 2 : 3;
+    } else if (detailStep == 2) {
+      parseCesqSignal(sendATCommand("AT+CESQ", 2000));
+      detailStep = 3;
+    } else {
+      parseCeregTac(sendATCommand("AT+CEREG?", 2000));
+      lastDetail = millis();
+      detailStep = 0;
+    }
+    nextDetailStepMs = millis() + SIGNAL_DETAIL_STEP_GAP_MS;
   }
 }
 
@@ -474,6 +629,8 @@ void modemHealthTick() {
   static bool inTick = false;
   if (inTick) return;                                   // 防重入（恢复期间 modemInit 会 pump handleClient）
   if (millis() - lastModemOkMs < MODEM_HEALTH_INTERVAL_MS) return;
+  if (lastWebRequestMs != 0 && millis() - lastWebRequestMs < SLOW_WORK_WEB_GRACE_MS) return;
+  if (!modemAtQuietFor(MODEM_BACKGROUND_AT_GAP_MS)) return;
   inTick = true;
 
   if (waitCEREG()) {
@@ -497,9 +654,9 @@ void modemHealthTick() {
 
 void blink_short(unsigned long gap_time) {
   digitalWrite(LED_BUILTIN, LOW);
-  delay(50);
+  waitWithWebPump(50);
   digitalWrite(LED_BUILTIN, HIGH);
-  delay(gap_time);
+  waitWithWebPump(gap_time);
 }
 
 // 发 AT 并判 OK：复用 sendATCommand 的读循环(含防重入泵/yield)，避免重复读逻辑
@@ -520,16 +677,13 @@ static bool sendSMSImpl(const char* phoneNumber, const char* message) {
   logCapture("目标号码: "); logCaptureLn(maskPhone(String(phoneNumber)));
   logCapture("短信内容: "); logCaptureLn(bodyPreview(String(message), SMS_LOG_VERBOSE));
 
-  if (modemSerialBusy) {
-    logCaptureLn("模组串口正忙，取消本次短信发送");
-    return false;
-  }
+  if (!beginModemSerialOp("发送短信")) return false;
   drainPendingSmsUrc(3000);
   if (smsUrcReceiving()) {
     logCaptureLn("短信接收窗口未空闲，取消本次短信发送以避免冲掉接收PDU");
+    endModemSerialOp();
     return false;
   }
-  if (!beginModemSerialOp("发送短信")) return false;
 
   // 使用pdulib编码PDU；pdu 是全局对象，必须在串口锁内使用，防止嵌套发送覆盖缓冲。
   pdu.setSCAnumber();  // 使用默认短信中心
@@ -979,8 +1133,9 @@ void processOutgoingSmsQueue() {
   if (smsUrcReceiving()) return; // 正在接收短信时避让，防止冲掉 PDU
   if (smsStoredWorkPending()) return;
   // 网页刚活跃则避让模组AT，但有上限：避让超过 SLOW_WORK_MAX_DEFER_MS 仍强制发出，防 SPA 持续轮询饿死本条。
-  if (lastWebRequestMs != 0 && millis() - lastWebRequestMs < SLOW_WORK_WEB_GRACE_MS &&
-      millis() - outSmsQueue[outSmsHead].queuedMs < SLOW_WORK_MAX_DEFER_MS) return;
+  if (lastWebRequestMs != 0 && millis() - lastWebRequestMs < OUT_SMS_WEB_GRACE_MS &&
+      millis() - outSmsQueue[outSmsHead].queuedMs < OUT_SMS_MAX_DEFER_MS) return;
+  if (!modemAtQuietFor(MODEM_FOREGROUND_AT_GAP_MS)) return;
 
   OutgoingSmsItem it = outSmsQueue[outSmsHead];
   clearOutgoingSmsSlot(outSmsHead);
