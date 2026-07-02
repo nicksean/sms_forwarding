@@ -37,6 +37,10 @@ extern WebServer server;
 extern bool configValid;
 extern bool timeSynced;
 extern bool modemReady;
+extern volatile uint8_t modemInitPhase;  // MODEM_INIT_PHASE_*：细分启动/注册阶段，供首页避免误判“无信号”
+extern int modemCeregStat;              // 最近一次 AT+CEREG? 注册状态(-1=未知, 1/5=已注册)
+extern bool modemSignalFresh;           // 本轮启动是否已完成至少一次 CSQ 快速采样
+extern bool modemIdentityFresh;         // 本轮启动是否已完成一次身份信息后台采样
 extern bool apMode;                   // 是否处于配网热点(SoftAP)模式
 extern volatile bool gInWebRequest;   // true=正在HTTP请求处理栈内；此时AT函数不得再泵server.handleClient()(防WebServer重入崩溃)
 extern volatile bool gWebServerReady; // true=server.begin() 已完成；启动早期只 yield，不碰未启动的 WebServer

@@ -112,9 +112,13 @@ void setup() {
   }
 
   static const char* headerKeys[] = {"If-None-Match"};
-  server.collectHeaders(headerKeys, 1);  // 首页缓存校验用：命中后返回 304，刷新不再完整重传大页面
+  server.collectHeaders(headerKeys, 1);  // gzip Web 资源缓存校验用：命中后返回 304
 
   server.on("/", handleRoot);
+  server.on("/assets/app.css", handleWebAsset);
+  server.on("/assets/app.js", handleWebAsset);
+  server.on("/ui", handleUiPanel);
+  server.on("/config.json", handleConfigJson);
   server.on("/save", HTTP_POST, handleSave);
   server.on("/tools", handleRoot);
   server.on("/sms", handleRoot);
@@ -185,9 +189,6 @@ void setup() {
   while (Serial1.available()) Serial1.read();
   modemInit();
 
-  // ---- 开机补收 SIM 中暂存的短信（断电期间到达的消息不丢）----
-  if (modemReady) backfillStoredSms(true);
-
   // 启动只写日志，不再发送邮件，避免断电/重启后产生多余通知。
   if (configValid && !apMode) {
     logCaptureLn("配置有效，启动通知邮件已禁用");
@@ -256,6 +257,7 @@ void loop() {
   checkConcatTimeout();
   if (Serial.available()) Serial1.write(Serial.read());
   checkSerial1URC();
+  modemRegistrationTick(); // CEREG 注册后台等待；成功后再补收 SIM 暂存短信，避免 setup 卡几十秒
   smsReceiveWatchdogTick(); // 收到 +CMTI 后优先按索引读取，避免其它 AT 操作抢串口
   processForwardQueue();   // 接收/转发解耦：每帧最多转发一条(仅规则判定+入队，无网络，开销极小)
   processOutgoingSmsQueue(); // 网页发短信异步出队，避免HTTP请求阻塞等待AT+CMGS

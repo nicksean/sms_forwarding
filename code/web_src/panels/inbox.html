@@ -1,0 +1,20 @@
+<div class="panel" id="panel-inbox">
+      <h1 class="page-title">收发短信</h1>
+      <p class="page-subtitle">本地留存最近收发的短信（接收最多 %INBOX_MAX% 条，仅本地查看）。支持全文检索与验证码高亮</p>
+      <div class="card">
+        <div class="card-header">
+          <div class="msg-tabs">
+            <button type="button" class="msg-tab active" id="tabRecv" onclick="smsTab('recv')">已接收</button>
+            <button type="button" class="msg-tab" id="tabSent" onclick="smsTab('sent')">已发送</button>
+          </div>
+          <input id="smsSearch" class="form-input" placeholder="搜索发件人或正文…" oninput="renderMessages()" style="max-width:240px;margin-left:auto;">
+          <button class="btn btn-secondary btn-sm" onclick="loadMessages()">刷新</button>
+          <button class="btn btn-primary btn-sm" onclick="openSmsModal()">发短信</button>
+        </div>
+        <div class="card-body">
+          <div id="inboxList">加载中...</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ===== 系统设置（账号 / 时间 / 维护） ===== -->

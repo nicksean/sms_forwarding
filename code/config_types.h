@@ -4,7 +4,7 @@
 #include <Arduino.h>
 
 // 固件版本（/status 与启动日志展示）
-#define FW_VERSION "1.0.1"
+#define FW_VERSION "1.0.2"
 
 // 配网热点(STA 连接失败/未配置时广播；运行中长按 BOOT 也可强制开启)
 #define AP_SSID_PREFIX "SMS-Forwarder-"
@@ -135,6 +135,10 @@ struct Config {
 #define CELLULAR_KEEPALIVE_MIN_BYTES   (48UL * 1024UL)  // 默认 payload 约 63KB；低于此值视为未达到保号流量
 #define CELLULAR_HTTP_TIMEOUT_MS       90000UL          // 蜂窝 HTTP 下载最长等待；含 DNS/HTTPS/漫游网络抖动
 #define CELLULAR_PDP_READY_TIMEOUT_MS  12000UL          // CGACT 返回 OK 后继续等 PDP 拿到有效 IP，再发起 MHTTP
+#define MODEM_REG_CHECK_INTERVAL_MS    1500UL           // 开机后 CEREG 后台注册探测间隔；不再阻塞 setup 等几十秒
+#define MODEM_REG_MAX_CHECKS           30               // 后台注册最多探测次数，超时后交给健康检查恢复
+#define MODEM_DATA_MODE_RETRY_GAP_MS   10000UL          // 启动时 CGACT 快速尝试失败后，后台重试间隔
+#define MODEM_DATA_MODE_RETRY_MAX      3                // CGACT 后台重试次数上限，避免长期抢占串口
 #define HTTP_CONNECT_TIMEOUT_MS  1500     // 推送 HTTP 连接超时：坏通道快速释放 worker，降低网页卡顿
 #define HTTP_READ_TIMEOUT_MS     2500     // 推送 HTTP 读超时，避免慢 Webhook 长时间占住 worker
 // 推送/邮件/测试三类慢任务已移到后台 worker(见 push.cpp::pushWorkerTask)，loop 不再被其阻塞，
@@ -160,6 +164,14 @@ struct Config {
 #define INBOX_MAX                50        // 本地收件箱留存最近短信条数(有界，控 RAM)
 #define INBOX_BODY_MAX           320       // 收件箱单条正文最大留存字符(超出截断，转发不受影响)
 #define SENT_MAX                 10        // 本地已发送短信留存条数(有界，控 RAM)
+
+// 模组启动阶段（/status 输出字符串；内部用数值减少 RAM）
+#define MODEM_INIT_PHASE_OFF         0
+#define MODEM_INIT_PHASE_POWERING    1
+#define MODEM_INIT_PHASE_AT_READY    2
+#define MODEM_INIT_PHASE_REGISTERING 3
+#define MODEM_INIT_PHASE_READY       4
+#define MODEM_INIT_PHASE_FAILED      5
 
 // 长短信分段结构
 struct SmsPart {

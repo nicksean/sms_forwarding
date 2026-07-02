@@ -1,0 +1,74 @@
+<div class="panel" id="panel-push">
+      <h1 class="page-title">转发设置</h1>
+      <p class="page-subtitle">邮件通知与最多 5 个推送通道（POST JSON、Bark、钉钉、飞书、PushPlus、Server酱、Gotify、Telegram）</p>
+      <div class="card-grid">
+      <div>
+      <form action="/save" method="POST" id="mainForm2">
+      <input type="hidden" name="emailForm" value="1">
+      <div class="card">
+        <div class="card-header">邮件通知 (SMTP)<label style="margin-left:auto;text-transform:none;font-family:var(--sans);font-size:11.5px;color:var(--fg);font-weight:500;cursor:pointer;"><input type="checkbox" name="emailEnabled" %EMAIL_EN%> 启用邮件转发</label></div>
+        <div class="card-body">
+          <div class="form-row">
+            <div class="form-group"><label class="form-label">SMTP 服务器</label><input class="form-input" type="text" name="smtpServer" value="%SMTP_SERVER%" placeholder="smtp.qq.com"></div>
+            <div class="form-group"><label class="form-label">SMTP 端口</label><input class="form-input" type="number" name="smtpPort" value="%SMTP_PORT%" placeholder="465"></div>
+          </div>
+          <div class="form-row">
+            <div class="form-group"><label class="form-label">邮箱账号</label><input class="form-input" type="text" name="smtpUser" value="%SMTP_USER%" placeholder="your@qq.com"></div>
+            <div class="form-group"><label class="form-label">密码 / 授权码</label><input class="form-input" type="password" name="smtpPass" value="%SMTP_PASS%" placeholder="授权码"></div>
+          </div>
+          <div class="form-group"><label class="form-label">接收邮件地址</label><input class="form-input" type="text" name="smtpSendTo" value="%SMTP_SEND_TO%" placeholder="receiver@example.com"></div>
+        </div>
+      </div>
+      <button type="submit" class="btn btn-primary btn-block btn-save">保存邮件设置</button>
+      </form>
+      <form action="/save" method="POST" id="mainForm3">
+      <input type="hidden" name="pushForm" value="1">
+      <div class="card">
+        <div class="card-header">推送通道<label style="margin-left:auto;text-transform:none;font-family:var(--sans);font-size:11.5px;color:var(--fg);font-weight:500;cursor:pointer;"><input type="checkbox" name="pushEnabled" %PUSH_EN%> 启用推送转发</label></div>
+        <div class="card-body">
+          %PUSH_CHANNELS%
+          <button type="button" class="btn btn-secondary btn-block" id="addChannelBtn" onclick="addChannel()" style="margin-top:8px;">+ 添加推送通道</button>
+        </div>
+      </div>
+      <button type="submit" class="btn btn-primary btn-block btn-save">保存推送通道</button>
+      </form>
+      </div>
+      <div>
+      <form action="/save" method="POST" id="mainForm4">
+      <div class="card">
+        <div class="card-header">管理员手机号</div>
+        <div class="card-body">
+          <div class="form-group">
+            <input class="form-input" type="text" name="adminPhone" value="%ADMIN_PHONE%" placeholder="+447700900456">
+            <p class="form-hint">此号码可通过短信发送远程指令（SMS:号码:内容 发短信、RESET 重启）</p>
+          </div>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-header">号码黑名单</div>
+        <div class="card-body">
+          <div class="form-group">
+            <textarea class="form-textarea" name="numberBlackList" rows="5" placeholder="每行一个号码">%NUMBER_BLACK_LIST%</textarea>
+            <p class="form-hint">黑名单号码发来的短信将被自动忽略</p>
+          </div>
+        </div>
+      </div>
+      <button type="submit" class="btn btn-primary btn-block btn-save">保存权限与过滤</button>
+      </form>
+      <form action="/save" method="POST" onsubmit="serializeRules()">
+        <textarea name="forwardRules" id="forwardRulesRaw" style="display:none;">%FORWARD_RULES%</textarea>
+        <div class="card">
+          <div class="card-header">转发规则<button type="button" class="btn btn-secondary btn-sm" style="margin-left:auto;" onclick="addRule()">+ 添加规则</button></div>
+          <div class="card-body">
+            <p class="form-hint" style="margin-bottom:10px;">按发件人 / 关键词 / 正则把短信分流到指定通道或丢弃，自上而下匹配、命中即止；无规则命中则转发到全部启用通道。</p>
+            <div id="rulesList"></div>
+          </div>
+        </div>
+        <button type="submit" class="btn btn-primary btn-block btn-save">保存转发规则</button>
+      </form>
+      </div>
+      </div>
+    </div>
+
+
+    <!-- ===== 定时与时间 (保号 + 定时重启/心跳 + 时间设置) ===== -->

@@ -87,7 +87,7 @@ Module layering (`#include` direction, bottom → top):
 (header-only inline pure helpers: json/url/html escape, phone mask, blacklist match, fnv1a dedup,
 keep-alive due-date, OTP, backoff, `streamTemplate`; host-tested) → `globals.h/.cpp` (extern globals
 + shared includes; includes `sms_logic.h` once for all modules) → feature modules (`config`, `modem`,
-`push`, `sms_process`, `scheduler`, `web_handlers`, `web_html`) → `code.ino` (`setup()` + `loop()`).
+`push`, `sms_process`, `scheduler`, `web_handlers`, `web_assets`(generated)) → `code.ino` (`setup()` + `loop()`).
 Detailed per-file guide: `dev_doc/module_details.md`; data-flow diagrams: `dev_doc/architecture.md`.
 
 Key flows:
@@ -99,11 +99,12 @@ Key flows:
 - **Push** (`push.cpp`): `sendToChannel()` is a `switch(channel.type)` over `PushType` (1–10:
   POST JSON, Bark, GET, DingTalk, PushPlus, ServerChan, Custom template, Feishu, Gotify, Telegram).
   DingTalk/Feishu HMAC-SHA256 signing uses ESP32's built-in `mbedtls_md`.
-- **Web** (`web_handlers.cpp` + `web_html.cpp`): single SPA page (`htmlPage` raw-literal in
-  web_html.cpp, JS-toggled panels). All routes behind HTTP Basic Auth (`config.webUser/webPass`,
-  default `admin`/`admin123`). `handleRoot()` **streams** the page from flash via
-  `streamTemplate()` + `server.sendContent_P()` (no full-page heap copy); `%PLACEHOLDER%` tokens are
-  resolved by a lambda, not `html.replace()`. Routes: `/`,`/save`,`/sendsms`,`/ping`,`/query`,
+- **Web** (`web_handlers.cpp` + `web_src/*` + generated `web_assets.cpp`): gzip-compressed SPA
+  shell plus lazy-loaded panels/CSS/JS. All routes behind HTTP Basic Auth (`config.webUser/webPass`,
+  default `admin`/`admin123`). `handleRoot()` sends the small gzip shell from PROGMEM; `/assets/*`
+  and `/ui?panel=` serve pre-gzipped assets with browser cache headers; `/config.json` supplies
+  dynamic form values for `%PLACEHOLDER%` tokens client-side. Routes: `/`,`/assets/app.css`,
+  `/assets/app.js`,`/ui`,`/config.json`,`/save`,`/sendsms`,`/ping`,`/query`,
   `/flight`,`/at`,`/log`(streamed, `?since=` cursor),`/modem`,`/wifi`,`/status`(health JSON),
   `/keepalive`,`/testpush`,`/ussd`. Sidebar icons are inline SVG (no emoji).
 - **Scheduler** (`scheduler.cpp`): E0 SIM keep-alive — absolute-date (NVS `kaLastTime`), power-loss
@@ -129,8 +130,9 @@ Key flows:
 - **New HTTP route**: add a handler in web_handlers.cpp → declare in web_handlers.h → register with
   `server.on()` in `setup()`. For large/dynamic responses prefer chunked `server.sendContent()`
   (set `CONTENT_LENGTH_UNKNOWN`, end with `sendContent("")`) over building one big `String`.
-- **New page placeholder**: add a `%TOKEN%` in web_html.cpp → add a branch in the `handleRoot()`
-  resolver lambda. (Tokens are matched as `%[A-Z0-9_]{2,}%`; bare `%` in CSS is safe.)
+- **New page placeholder**: add a `%TOKEN%` in the relevant `code/web_src/panels/*.html` file →
+  add it to `renderConfigTemplate()` in `code/web_src/app.js` and include any needed field in
+  `/config.json`. After editing `web_src`, run `python tools/build_web_assets.py`.
 - **New pure/portable logic**: put it in `sms_logic.h` (inline, depends only on `String`+libc) and
   add a host test in `test/run_tests.cpp` so it's verifiable without hardware.
 - **Logging**: use `logCapture()` to append to the current line buffer and `logCaptureLn()` /

@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>SMS Forwarding</title>
+  <link rel="stylesheet" href="/assets/app.css?v={{ASSET_HASH}}">
+</head>
+<body>
+<aside class="sidebar">
+    <div class="sidebar-brand">
+      <h2>短信转发器</h2>
+      <span>ESP32-C3 控制台</span>
+    </div>
+    <nav class="sidebar-nav">
+      <div class="sidebar-section-label">概览</div>
+      <a data-panel="overview" class="active"><span class="ico"><svg viewBox="0 0 24 24"><path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><path d="M9 22V12h6v10"/></svg></span> <span>系统概览</span></a>
+      <a data-panel="sim"><span class="ico"><svg viewBox="0 0 24 24"><path d="M19 21H5a2 2 0 0 1-2-2V8l5-5h9a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2z"/><rect x="8" y="13" width="8" height="5" rx="1"/></svg></span> <span>网络设置</span></a>
+      <div class="sidebar-divider"></div>
+      <div class="sidebar-section-label">短信</div>
+      <a data-panel="inbox"><span class="ico"><svg viewBox="0 0 24 24"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg></span> <span>收发短信</span></a>
+      <div class="sidebar-divider"></div>
+      <div class="sidebar-section-label">转发设置</div>
+      <a data-panel="push"><span class="ico"><svg viewBox="0 0 24 24"><path d="M10 13a5 5 0 0 0 7 0l3-3a5 5 0 0 0-7-7l-1 1"/><path d="M14 11a5 5 0 0 0-7 0l-3 3a5 5 0 0 0 7 7l1-1"/></svg></span> <span>转发设置</span></a>
+      <div class="sidebar-divider"></div>
+      <div class="sidebar-section-label">诊断</div>
+      <a data-panel="diagnose"><span class="ico"><svg viewBox="0 0 24 24"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg></span> <span>诊断与控制</span></a>
+      <a data-panel="atterm"><span class="ico"><svg viewBox="0 0 24 24"><path d="M4 17l6-6-6-6"/><path d="M12 19h8"/></svg></span> <span>AT 终端</span></a>
+      <a data-panel="log"><span class="ico"><svg viewBox="0 0 24 24"><path d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01"/></svg></span> <span>系统日志</span></a>
+      <div class="sidebar-divider"></div>
+      <div class="sidebar-section-label">自动化</div>
+      <a data-panel="keepalive"><span class="ico"><svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="18" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/><circle cx="12" cy="15" r="3"/></svg></span> <span>定时任务</span></a>
+      <div class="sidebar-divider"></div>
+      <div class="sidebar-section-label">系统</div>
+      <a data-panel="settings"><span class="ico"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg></span> <span>系统设置</span></a>
+    </nav>
+    <!-- 主题切换已移除：固定浅色 -->
+  </aside>
+
+  <main class="main" id="panelHost">
+    <div class="msg-empty" id="panelLoading">加载中...</div>
+  </main>
+
+<!-- ===== 发短信 弹窗 ===== -->
+    <div class="modal-overlay" id="smsModal" onclick="if(event.target===this)closeSmsModal()">
+      <div class="modal">
+        <div class="modal-head"><span>发送短信</span><button class="modal-x" onclick="closeSmsModal()" aria-label="关闭">&times;</button></div>
+        <div class="form-group"><label class="form-label">目标号码</label><input class="form-input" type="text" id="smsPhone" placeholder="+447700900456"></div>
+        <div class="form-group"><label class="form-label">短信内容</label><textarea class="form-textarea" id="smsContent" placeholder="输入短信内容..." oninput="updateCount(this)"></textarea><p class="form-hint">已输入 <span id="charCount">0</span> 字符</p></div>
+        <div class="result-box" id="smsSendResult"></div>
+        <div class="modal-foot"><button class="btn btn-secondary" onclick="closeSmsModal()">取消</button><button class="btn btn-primary" id="smsSendBtn" onclick="sendSmsModal()">发送</button></div>
+      </div>
+    </div>
+
+
+  <div class="drawer-bg" id="drawerBg" onclick="closeMsgDrawer()"></div>
+  <aside class="msg-drawer" id="msgDrawer">
+    <div class="dh">短信详情<button class="x" onclick="closeMsgDrawer()">&times;</button></div>
+    <div class="db" id="drawerBody"></div>
+  </aside>
+  <script src="/assets/app.js?v={{ASSET_HASH}}" defer></script>
+</body>
+</html>

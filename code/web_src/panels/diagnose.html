@@ -1,0 +1,40 @@
+<div class="panel" id="panel-diagnose">
+      <h1 class="page-title">诊断与控制</h1>
+      <p class="page-subtitle">执行蜂窝 payload 下载、USSD、重启、飞行模式等操作</p>
+      <div class="card-grid">
+        <div class="card">
+          <div class="card-header">蜂窝 payload 测试</div>
+          <div class="card-body">
+            <div class="at-bar"><input class="form-input" type="url" id="pingUrl" placeholder="http://gg.incrafttime.top/api/payload?size=64342"><button class="btn btn-primary btn-sm" id="pingBtn" onclick="doPing()">下载 payload</button></div>
+            <p class="form-hint">临时启用蜂窝数据(PDP)，通过模组蜂窝网络下载 payload，完成后自动关闭</p>
+            <div class="result-box" id="pingResult"></div>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-header">USSD 查询（如查余额）</div>
+          <div class="card-body">
+            <div class="at-bar"><input class="form-input" type="text" id="ussdCode" placeholder="如 *122# 或 *#1345#"><button class="btn btn-primary btn-sm" onclick="sendUssd()">查询</button></div>
+            <p class="form-hint">通过 AT+CUSD 发起，可用于保号/查余额；结果依运营商而定</p>
+            <div class="result-box" id="ussdResult"></div>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-header">模组重启</div>
+          <div class="card-body">
+            <div class="btn-row"><button class="btn btn-danger" onclick="modemAction('restart')">模组软重启</button><button class="btn btn-danger" onclick="modemAction('hardreset')">模组硬重启</button></div>
+            <p class="form-hint"><b>软重启</b>：发送 AT+CFUN=1,1 让模组重新注册网络，约 15 秒、<b>不断电</b>，适合仍能响应 AT 但网络异常 / 长时间不收短信时。<br><b>硬重启</b>：通过 EN 引脚给模组断电再上电（约 10 秒），相当于拔插一次电，用于模组卡死、软重启无效。<br>重启的是<b>模组</b>，不是 ESP32 主控；主控重启在「系统维护」。</p>
+            <div class="result-box" id="modemRstResult"></div>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-header">飞行模式</div>
+          <div class="card-body">
+            <div class="btn-row"><button class="btn btn-danger" id="flightBtn" onclick="toggleFlightMode()">切换飞行模式</button><button class="btn btn-secondary" onclick="queryFlightMode()">查询状态</button></div>
+            <p class="form-hint">飞行模式开启后模组射频关闭，无法收发短信</p>
+            <div class="result-box" id="flightResult"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ===== AT Terminal ===== -->

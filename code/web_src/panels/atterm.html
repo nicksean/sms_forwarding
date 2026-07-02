@@ -1,0 +1,15 @@
+<div class="panel" id="panel-atterm">
+      <h1 class="page-title">AT 指令终端</h1>
+      <p class="page-subtitle">直接向模组发送 AT 指令并接收响应</p>
+      <div class="card">
+        <div class="card-header">终端</div>
+        <div class="card-body">
+          <div id="atLog">就绪 — 输入 AT 指令开始调试</div>
+          <div class="at-bar"><input class="form-input" type="text" id="atCmd" placeholder="AT+CSQ"><button class="btn btn-primary btn-sm" onclick="sendAT()" id="atBtn">发送</button></div>
+          <div class="btn-row" style="margin-top:8px;"><button class="btn btn-secondary btn-sm" onclick="clearATLog()">清空日志</button></div>
+          <p class="form-hint">直接向模组串口发送指令并接收响应，请谨慎操作</p>
+        </div>
+      </div>
+    </div>
+
+    <!-- ===== System Log ===== -->

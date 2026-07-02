@@ -1,0 +1,44 @@
+<div class="panel" id="panel-sim">
+      <h1 class="page-title">网络设置</h1>
+      <p class="page-subtitle">WiFi 接入、蜂窝数据与 SIM 注册设置。本机经 WiFi 转发，默认不开启蜂窝流量</p>
+      <div class="card-grid">
+        <form action="/save" method="POST" id="simFormEl">
+        <input type="hidden" name="simForm" value="1">
+        <div class="card">
+          <div class="card-header">蜂窝数据设置</div>
+          <div class="card-body">
+            <div class="form-group"><label class="form-label"><input type="checkbox" name="dataEnabled" %DATA_CHECKED%> 允许蜂窝数据（流量）</label>
+              <p class="form-hint" style="color:var(--error);font-weight:600">注意：开启会导致收不到短信，模组会掉为纯数据附着，丢失承载短信的 CS/SGs 信令域（漫游时尤其明显）。本机经 WiFi 转发，无需开流量，保持关闭即可。</p>
+              <p class="form-hint">默认关闭=禁用 PDP，零流量。仅在需要保号 HTTP payload / 蜂窝 IP 时临时开启。</p></div>
+            <div class="form-group"><label class="form-label">APN</label><input class="form-input" type="text" name="apn" value="%APN%" placeholder="留空=运营商自动（如 cmnet）"></div>
+            <div class="form-group"><label class="form-label">运营商</label>
+              <input class="form-input" type="text" name="operatorPlmn" value="%OPERATOR_PLMN%" placeholder="留空 = 自动注册（推荐）" list="plmnList">
+              <datalist id="plmnList">
+                <option value="46000">中国移动</option>
+                <option value="46001">中国联通</option>
+                <option value="46011">中国电信</option>
+                <option value="46015">中国广电</option>
+                <option value="310260">T-Mobile US（国外示例）</option>
+                <option value="23410">O2 UK（国外示例）</option>
+              </datalist>
+              <p class="form-hint">从列表选运营商或手动填 PLMN(MCC+MNC，国外同理)。仅能选 SIM 可接入的网络，锁定不可达会失网；不确定留空自动。</p></div>
+          </div>
+        </div>
+        <button type="submit" class="btn btn-primary btn-block btn-save">保存蜂窝设置</button>
+        </form>
+        <div class="card">
+          <div class="card-header">WiFi 网络<button class="btn btn-secondary btn-sm" style="margin-left:auto;" onclick="wifiScan()">扫描</button></div>
+          <div class="card-body">
+            <div class="form-group"><label class="form-label">选择网络</label><select class="form-select" id="wifiScanSel" onchange="wifiPick()"><option value="">点“扫描”获取周边 WiFi</option></select></div>
+            <div class="form-group"><label class="form-label">WiFi 名称 (SSID)</label><input class="form-input" type="text" id="wifiSsidIn" placeholder="从上方选择或手动输入"></div>
+            <div class="form-group"><label class="form-label">WiFi 密码</label><input class="form-input" type="password" id="wifiPassIn" placeholder="开放网络留空"></div>
+            <div class="btn-row"><button class="btn btn-primary" onclick="wifiSave()">保存并重启接入</button><button class="btn btn-secondary" onclick="wifiRestart()">重连当前网络</button></div>
+            <p class="form-hint">保存后设备重启接入新网络；若连接失败会自动重开配网热点供你重配</p>
+            <div class="result-box" id="wifiCfgResult"></div>
+            <div class="result-box" id="wifiResult"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ===== SMS (收 / 发) ===== -->

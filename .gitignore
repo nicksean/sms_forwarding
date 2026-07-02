@@ -1,5 +1,12 @@
 code/wifi_config.h
 
+# Arduino / ESP32 编译产物：统一只允许输出到 build/，且不纳入版本库
+/build/**
+!/build/
+!/build/AGENTS.md
+/build-codex/
+/build-codex2/
+
 # 主机测试构建产物
 test/run_tests
 test/run_tests.exe

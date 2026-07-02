@@ -1,5 +1,5 @@
 #include "web_handlers.h"
-#include "web_html.h"
+#include "web_assets.h"
 #include "config.h"
 #include "modem.h"
 #include "push.h"
@@ -17,34 +17,19 @@ int logBufCount = 0;
 unsigned long logSeq = 0;  // 单调递增的累计行号(/log since 游标)
 static String _logLine;    // 行缓冲：logCapture 写入这里，logCaptureLn 提交整行
 
-// 首页是大块 HTML/JS/CSS，允许浏览器缓存；配置变更后递增版本让缓存自动失效。
-static uint32_t webPageRev = 1;
-static uint32_t webPageBootNonce = 0;
-
-static uint32_t getWebPageBootNonce() {
-  if (webPageBootNonce == 0) {
-    webPageBootNonce = esp_random();
-    if (webPageBootNonce == 0) webPageBootNonce = (uint32_t)millis() | 1u;
-  }
-  return webPageBootNonce;
-}
-
 static void bumpWebPageCacheRev() {
-  webPageRev++;
-  if (webPageRev == 0) webPageRev = 1;
+  // 配置保存后前端会重新拉 /config.json；静态 gzip 资源由 hash URL 控制缓存。
 }
 
-static String makeWebPageEtag() {
-  String tag;
-  tag.reserve(48);
-  tag += "\"sms-";
-  tag += FW_VERSION;
-  tag += "-";
-  tag += String(getWebPageBootNonce(), HEX);
-  tag += "-";
-  tag += String(webPageRev, HEX);
-  tag += "\"";
-  return tag;
+static const char* modemPhaseName() {
+  switch (modemInitPhase) {
+    case MODEM_INIT_PHASE_POWERING: return "powering";
+    case MODEM_INIT_PHASE_AT_READY: return "at_ready";
+    case MODEM_INIT_PHASE_REGISTERING: return "registering";
+    case MODEM_INIT_PHASE_READY: return "ready";
+    case MODEM_INIT_PHASE_FAILED: return "failed";
+    default: return "off";
+  }
 }
 
 static void _logAppend(const String& line) {
@@ -121,168 +106,113 @@ bool checkAuth(bool markActivity) {
   return true;
 }
 
-// 处理配置页面请求
-//
-// 关键优化：不再 `String html = String(htmlPage)`(整页 ~37KB 拷进堆) + ~20 次
-// replace()(每次可重分配) + send()(再缓冲)。改为分块流式：静态片段用 sendContent_P 直接
-// 从 flash 流出，仅把小动态值/通道块写出。占位符识别走 sms_logic.h::streamTemplate
-// (已主机测试，安全跳过 CSS 中的裸 %)。峰值堆从 ~80KB+ 降到 <10KB。
-void handleRoot() {
-  if (!checkAuth()) return;
-  String etag = makeWebPageEtag();
+static void sendGzipAsset(const WebAsset& asset, const char* cacheControl) {
   String inm = server.header("If-None-Match");
-  if (inm.indexOf(etag) >= 0) {
-    server.sendHeader("Cache-Control", "private, no-cache, must-revalidate");
-    server.sendHeader("ETag", etag);
-    server.sendHeader("Vary", "Authorization");
+  if (inm.indexOf(asset.etag) >= 0) {
+    server.sendHeader("Cache-Control", cacheControl);
+    server.sendHeader("ETag", asset.etag);
+    server.sendHeader("Vary", "Authorization, Accept-Encoding");
     server.send(304, "text/plain", "");
     return;
   }
+  server.sendHeader("Cache-Control", cacheControl);
+  server.sendHeader("ETag", asset.etag);
+  server.sendHeader("Vary", "Authorization, Accept-Encoding");
+  server.sendHeader("Content-Encoding", "gzip");
+  server.setContentLength(asset.length);
+  server.send(200, asset.mime, "");
+  server.sendContent_P((const char*)asset.data, asset.length);
+}
 
-  auto escHtml = [](const String& v) -> String { return htmlEscape(v); };
+// 处理配置页面请求：只发小型 gzip shell，CSS/JS/面板由浏览器按需加载。
+void handleRoot() {
+  if (!checkAuth()) return;
+  sendGzipAsset(WEB_INDEX, "private, no-cache, must-revalidate");
+}
 
-  // 唯一较大的动态块：推送通道 HTML，预留容量一次成型，避免多次重分配
-  String channelsHtml;
-  channelsHtml.reserve(6144);
-  for (int i = 0; i < MAX_PUSH_CHANNELS; i++) {
-    String idx = String(i);
-    String enabledClass = config.pushChannels[i].enabled ? " enabled" : "";
-    String checked = config.pushChannels[i].enabled ? " checked" : "";
-    
-    channelsHtml += "<div class=\"push-channel" + enabledClass + "\" id=\"channel" + idx + "\">";
-    channelsHtml += "<div class=\"push-channel-header\">";
-    channelsHtml += "<input type=\"checkbox\" name=\"push" + idx + "en\" id=\"push" + idx + "en\" onchange=\"toggleChannel(" + idx + ")\"" + checked + ">";
-    channelsHtml += "<label for=\"push" + idx + "en\" class=\"label-inline\">启用推送通道 " + String(i + 1) + "</label>";
-    channelsHtml += "</div>";
-    channelsHtml += "<div class=\"push-channel-body\">";
-    
-    // 通道名称
-    channelsHtml += "<div class=\"form-group\">";
-    channelsHtml += "<label>通道名称</label>";
-    channelsHtml += "<input type=\"text\" name=\"push" + idx + "name\" value=\"" + escHtml(config.pushChannels[i].name) + "\" placeholder=\"自定义名称\">";
-    channelsHtml += "</div>";
-    
-    // 推送类型
-    channelsHtml += "<div class=\"form-group\">";
-    channelsHtml += "<label>推送方式</label>";
-    channelsHtml += "<select name=\"push" + idx + "type\" id=\"push" + idx + "type\" onchange=\"updateTypeHint(" + idx + ")\">";
-    channelsHtml += "<option value=\"1\"" + String(config.pushChannels[i].type == PUSH_TYPE_POST_JSON ? " selected" : "") + ">POST JSON（通用格式）</option>";
-    channelsHtml += "<option value=\"2\"" + String(config.pushChannels[i].type == PUSH_TYPE_BARK ? " selected" : "") + ">Bark（iOS推送）</option>";
-    channelsHtml += "<option value=\"3\"" + String(config.pushChannels[i].type == PUSH_TYPE_GET ? " selected" : "") + ">GET请求（参数在URL中）</option>";
-    channelsHtml += "<option value=\"4\"" + String(config.pushChannels[i].type == PUSH_TYPE_DINGTALK ? " selected" : "") + ">钉钉机器人</option>";
-    channelsHtml += "<option value=\"5\"" + String(config.pushChannels[i].type == PUSH_TYPE_PUSHPLUS ? " selected" : "") + ">PushPlus</option>";
-    channelsHtml += "<option value=\"6\"" + String(config.pushChannels[i].type == PUSH_TYPE_SERVERCHAN ? " selected" : "") + ">Server酱</option>";
-    channelsHtml += "<option value=\"7\"" + String(config.pushChannels[i].type == PUSH_TYPE_CUSTOM ? " selected" : "") + ">自定义模板</option>";
-    channelsHtml += "<option value=\"8\"" + String(config.pushChannels[i].type == PUSH_TYPE_FEISHU ? " selected" : "") + ">飞书机器人</option>";
-    channelsHtml += "<option value=\"9\"" + String(config.pushChannels[i].type == PUSH_TYPE_GOTIFY ? " selected" : "") + ">Gotify</option>";
-    channelsHtml += "<option value=\"10\"" + String(config.pushChannels[i].type == PUSH_TYPE_TELEGRAM ? " selected" : "") + ">Telegram Bot</option>";
-    channelsHtml += "</select>";
-    channelsHtml += "<div class=\"push-type-hint\" id=\"hint" + idx + "\"></div>";
-    channelsHtml += "</div>";
-    
-    // URL
-    channelsHtml += "<div class=\"form-group\">";
-    channelsHtml += "<label>推送URL/Webhook</label>";
-    channelsHtml += "<input type=\"text\" name=\"push" + idx + "url\" value=\"" + escHtml(config.pushChannels[i].url) + "\" placeholder=\"http://your-server.com/api 或 webhook地址\">";
-    channelsHtml += "</div>";
-    
-    // 额外参数区域（钉钉/PushPlus/Server酱等需要）
-    channelsHtml += "<div id=\"extra" + idx + "\" style=\"display:none;\">";
-    channelsHtml += "<div class=\"form-group\">";
-    channelsHtml += "<label id=\"key1label" + idx + "\">参数1</label>";
-    channelsHtml += "<input type=\"text\" name=\"push" + idx + "key1\" id=\"key1" + idx + "\" value=\"" + escHtml(config.pushChannels[i].key1) + "\">";
-    channelsHtml += "</div>";
-    channelsHtml += "<div class=\"form-group\" id=\"key2group" + idx + "\">";
-    channelsHtml += "<label id=\"key2label" + idx + "\">参数2</label>";
-    channelsHtml += "<input type=\"text\" name=\"push" + idx + "key2\" id=\"key2" + idx + "\" value=\"" + escHtml(config.pushChannels[i].key2) + "\">";
-    channelsHtml += "</div>";
-    channelsHtml += "</div>";
-    
-    // 自定义模板区域
-    channelsHtml += "<div id=\"custom" + idx + "\" style=\"display:none;\">";
-    channelsHtml += "<div class=\"form-group\">";
-    channelsHtml += "<label>请求体模板（使用 {sender} {message} {timestamp} 占位符）</label>";
-    channelsHtml += "<textarea name=\"push" + idx + "body\" rows=\"4\" style=\"width:100%;font-family:monospace;\">" + escHtml(config.pushChannels[i].customBody) + "</textarea>";
-    channelsHtml += "</div>";
-    channelsHtml += "</div>";
-    
-    // 测试按钮(置于通道体内，启用时可见)
-    channelsHtml += "<button type=\"button\" class=\"btn btn-secondary btn-sm\" onclick=\"testPush(" + idx + ")\">测试推送</button>";
-    channelsHtml += "<div class=\"result-box\" id=\"pushTestResult" + idx + "\"></div>";
-
-    channelsHtml += "</div></div>";
+void handleWebAsset() {
+  if (!checkAuth(false)) return;
+  String uri = server.uri();
+  if (uri.endsWith("/app.css")) {
+    sendGzipAsset(WEB_APP_CSS, "private, max-age=31536000, immutable");
+  } else if (uri.endsWith("/app.js")) {
+    sendGzipAsset(WEB_APP_JS, "private, max-age=31536000, immutable");
+  } else {
+    server.send(404, "text/plain", "Not Found");
   }
+}
 
-  // 概览页面的动态值
+void handleUiPanel() {
+  if (!checkAuth(false)) return;
+  String name = server.arg("panel");
+  const WebAsset* asset = findWebPanelAsset(name);
+  if (!asset) {
+    server.send(404, "text/plain", "Unknown panel");
+    return;
+  }
+  sendGzipAsset(*asset, "private, max-age=31536000, immutable");
+}
+
+void handleConfigJson() {
+  if (!checkAuth(false)) return;
+  server.sendHeader("Cache-Control", "no-store, max-age=0");
+  server.sendHeader("Pragma", "no-cache");
   long uptimeSec = millis() / 1000;
   char uptimeBuf[16];
-  snprintf(uptimeBuf, sizeof(uptimeBuf), "%ld:%02ld:%02ld", uptimeSec / 3600, (uptimeSec % 3600) / 60, uptimeSec % 60);
+  snprintf(uptimeBuf, sizeof(uptimeBuf), "%ld:%02ld:%02ld",
+           uptimeSec / 3600, (uptimeSec % 3600) / 60, uptimeSec % 60);
   bool emailOk = config.smtpServer.length() > 0 && config.smtpUser.length() > 0 &&
                  config.smtpPass.length() > 0 && config.smtpSendTo.length() > 0;
   int pushCount = 0;
+  for (int i = 0; i < MAX_PUSH_CHANNELS; i++) if (config.pushChannels[i].enabled) pushCount++;
+
+  String j;
+  j.reserve(5200);
+  j += "{";
+  j += "\"assetHash\":\""; j += WEB_ASSET_HASH; j += "\",";
+  j += "\"uptimeText\":\""; j += uptimeBuf; j += "\",";
+  j += "\"webUser\":\""; j += jsonEscape(config.webUser); j += "\",";
+  j += "\"webPass\":\""; j += jsonEscape(config.webPass); j += "\",";
+  j += "\"smtpServer\":\""; j += jsonEscape(config.smtpServer); j += "\",";
+  j += "\"smtpPort\":"; j += String(config.smtpPort); j += ",";
+  j += "\"smtpUser\":\""; j += jsonEscape(config.smtpUser); j += "\",";
+  j += "\"smtpPass\":\""; j += jsonEscape(config.smtpPass); j += "\",";
+  j += "\"smtpSendTo\":\""; j += jsonEscape(config.smtpSendTo); j += "\",";
+  j += "\"adminPhone\":\""; j += jsonEscape(config.adminPhone); j += "\",";
+  j += "\"numberBlackList\":\""; j += jsonEscape(config.numberBlackList); j += "\",";
+  j += "\"forwardRules\":\""; j += jsonEscape(config.forwardRules); j += "\",";
+  j += "\"emailEnabled\":"; j += (config.emailEnabled ? "true" : "false"); j += ",";
+  j += "\"pushEnabled\":"; j += (config.pushEnabled ? "true" : "false"); j += ",";
+  j += "\"emailConfigured\":"; j += (emailOk ? "true" : "false"); j += ",";
+  j += "\"modemReady\":"; j += (modemReady ? "true" : "false"); j += ",";
+  j += "\"pushEnabledCount\":"; j += String(pushCount); j += ",";
+  j += "\"inboxMax\":"; j += String(INBOX_MAX); j += ",";
+  j += "\"ntpServer\":\""; j += jsonEscape(config.ntpServer); j += "\",";
+  j += "\"tzOffsetMin\":"; j += String(config.tzOffsetMin); j += ",";
+  j += "\"rebootEnabled\":"; j += (config.rebootEnabled ? "true" : "false"); j += ",";
+  j += "\"rebootHour\":"; j += String(config.rebootHour); j += ",";
+  j += "\"hbEnabled\":"; j += (config.hbEnabled ? "true" : "false"); j += ",";
+  j += "\"hbHour\":"; j += String(config.hbHour); j += ",";
+  j += "\"dataEnabled\":"; j += (config.dataEnabled ? "true" : "false"); j += ",";
+  j += "\"apn\":\""; j += jsonEscape(config.apn); j += "\",";
+  j += "\"phoneNumber\":\""; j += jsonEscape(config.phoneNumber.length() ? config.phoneNumber : modemPhone); j += "\",";
+  j += "\"operatorPlmn\":\""; j += jsonEscape(config.operatorPlmn); j += "\",";
+  j += "\"pushChannels\":[";
   for (int i = 0; i < MAX_PUSH_CHANNELS; i++) {
-    if (config.pushChannels[i].enabled) pushCount++;
+    if (i) j += ",";
+    const PushChannel& ch = config.pushChannels[i];
+    j += "{";
+    j += "\"enabled\":"; j += (ch.enabled ? "true" : "false"); j += ",";
+    j += "\"type\":"; j += String((int)ch.type); j += ",";
+    j += "\"name\":\""; j += jsonEscape(ch.name); j += "\",";
+    j += "\"url\":\""; j += jsonEscape(ch.url); j += "\",";
+    j += "\"key1\":\""; j += jsonEscape(ch.key1); j += "\",";
+    j += "\"key2\":\""; j += jsonEscape(ch.key2); j += "\",";
+    j += "\"customBody\":\""; j += jsonEscape(ch.customBody); j += "\"";
+    j += "}";
   }
-
-  // 占位符解析器：命中已知 token 填值返回 true，未知原样保留
-  auto resolve = [&](const String& name, String& out) -> bool {
-    if (name == "IP") out = WiFi.localIP().toString();
-    else if (name == "WIFI_SSID") out = escHtml(String(WiFi.SSID()));
-    else if (name == "FREE_HEAP") out = String(ESP.getFreeHeap() / 1024) + " KB";
-    else if (name == "UPTIME") out = String(uptimeBuf);
-    else if (name == "WEB_USER") out = escHtml(config.webUser);
-    else if (name == "WEB_PASS") out = escHtml(config.webPass);
-    else if (name == "SMTP_SERVER") out = escHtml(config.smtpServer);
-    else if (name == "SMTP_PORT") out = String(config.smtpPort);
-    else if (name == "SMTP_USER") out = escHtml(config.smtpUser);
-    else if (name == "SMTP_PASS") out = escHtml(config.smtpPass);
-    else if (name == "SMTP_SEND_TO") out = escHtml(config.smtpSendTo);
-    else if (name == "ADMIN_PHONE") out = escHtml(config.adminPhone);
-    else if (name == "NUMBER_BLACK_LIST") out = escHtml(config.numberBlackList);
-    else if (name == "FORWARD_RULES") out = escHtml(config.forwardRules);
-    else if (name == "SMTP_CHECK") out = emailOk ? "已配置" : "未配置";
-    else if (name == "EMAIL_EN") out = config.emailEnabled ? "checked" : "";
-    else if (name == "PUSH_EN") out = config.pushEnabled ? "checked" : "";
-    else if (name == "MODEM_CHECK") out = modemReady ? "已就绪" : "未就绪";
-    else if (name == "PUSH_COUNT") out = String(pushCount);
-    else if (name == "INBOX_MAX") out = String(INBOX_MAX);
-    else if (name == "NTP") out = escHtml(config.ntpServer);
-    else if (name == "RB_CHECKED") out = config.rebootEnabled ? "checked" : "";
-    else if (name == "RB_HOUR") out = String(config.rebootHour);
-    else if (name == "HB_CHECKED") out = config.hbEnabled ? "checked" : "";
-    else if (name == "HB_HOUR") out = String(config.hbHour);
-    else if (name == "TZ_OPTIONS") {
-      static const int tzMin[] = {480, 540, 420, 330, 60, 0, -300, -360, -480};
-      static const char* tzLbl[] = {"UTC+8 北京/香港", "UTC+9 东京", "UTC+7 曼谷", "UTC+5:30 印度",
-                                    "UTC+1 中欧", "UTC/GMT", "UTC-5 纽约", "UTC-6 芝加哥", "UTC-8 洛杉矶"};
-      String o; o.reserve(512);
-      for (unsigned i = 0; i < sizeof(tzMin) / sizeof(tzMin[0]); i++) {
-        o += "<option value=\""; o += String(tzMin[i]); o += "\"";
-        if (tzMin[i] == config.tzOffsetMin) o += " selected";
-        o += ">"; o += tzLbl[i]; o += "</option>";
-      }
-      out = o;
-    }
-    else if (name == "DATA_CHECKED") out = config.dataEnabled ? "checked" : "";
-    else if (name == "APN") out = escHtml(config.apn);
-    else if (name == "PHONE_NUMBER") out = escHtml(config.phoneNumber.length() ? config.phoneNumber : modemPhone);  // 空则预填自动读取号码
-    else if (name == "OPERATOR_PLMN") out = escHtml(config.operatorPlmn);
-    else if (name == "PUSH_CHANNELS") out = channelsHtml;
-    else return false;
-    return true;
-  };
-
-  // 分块流式发送：CONTENT_LENGTH_UNKNOWN 触发 chunked transfer-encoding。
-  // ETag + 304 让刷新时只做轻量校验，避免每次完整重传大页面。
-  server.sendHeader("Cache-Control", "private, no-cache, must-revalidate");
-  server.sendHeader("ETag", etag);
-  server.sendHeader("Vary", "Authorization");
-  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
-  server.send(200, "text/html", "");
-  streamTemplate(htmlPage,
-                 [](const char* p, size_t n) { if (n) server.sendContent_P(p, n); },
-                 resolve);
-  server.sendContent("");  // 终止 chunk
+  j += "]}";
+  server.send(200, "application/json", j);
 }
 
 // 处理工具箱页面请求 — 已整合到主页，直接返回主页
@@ -824,10 +754,14 @@ void handleStatus() {
     if (config.pushChannels[i].enabled) pushCount++;
   }
   String j;
-  j.reserve(1450);  // /status 字段较多，预留足够空间减少 String 重分配
+  j.reserve(1600);  // /status 字段较多，预留足够空间减少 String 重分配
   j += "{";
   j += "\"version\":\""; j += FW_VERSION; j += "\",";
   j += "\"modemReady\":"; j += (modemReady ? "true" : "false"); j += ",";
+  j += "\"modemInitPhase\":\""; j += modemPhaseName(); j += "\",";
+  j += "\"ceregStat\":"; j += String(modemCeregStat); j += ",";
+  j += "\"signalFresh\":"; j += (modemSignalFresh ? "true" : "false"); j += ",";
+  j += "\"identityFresh\":"; j += (modemIdentityFresh ? "true" : "false"); j += ",";
   j += "\"wifiConnected\":"; j += (WiFi.status() == WL_CONNECTED ? "true" : "false"); j += ",";
   j += "\"apMode\":"; j += (apMode ? "true" : "false"); j += ",";
   j += "\"ssid\":\""; j += jsonEscape(WiFi.SSID()); j += "\",";

@@ -4,6 +4,7 @@ on:
   push:
     paths:
       - 'code/**'
+      - 'tools/**'
   pull_request:
   workflow_dispatch:
 
@@ -29,6 +30,10 @@ jobs:
       run: |
         arduino-cli lib install "pdulib"
         arduino-cli lib install "ReadyMail"
+
+    - name: Verify generated web assets
+      run: |
+        python tools/build_web_assets.py --check
     
     - name: Compile firmware
       run: |

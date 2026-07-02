@@ -7,6 +7,18 @@
 
 static bool modemSerialBusy = false;
 static unsigned long lastModemAtEndMs = 0;
+static bool modemRegistrationPending = false;
+static unsigned long nextRegistrationCheckMs = 0;
+static uint8_t registrationCheckCount = 0;
+static uint8_t postRegisterStep = 0;
+static bool dataModeRetryPending = false;
+static unsigned long nextDataModeRetryMs = 0;
+static uint8_t dataModeRetryCount = 0;
+static unsigned long signalLastFastMs = 0;
+static unsigned long signalLastDetailMs = 0;
+
+static bool sampleSignalFastNow(unsigned long timeout = 1200);
+static void noteNetworkRegistered();
 
 bool modemSerialTryBegin(const char* label) {
   if (modemSerialBusy) {
@@ -130,9 +142,60 @@ String sendATCommand(const char* cmd, unsigned long timeout) {
   return resp;
 }
 
+static int parseCeregStatValue(const String& resp) {
+  int ce = resp.indexOf("+CEREG:");
+  if (ce < 0) return -1;
+  int colon = resp.indexOf(':', ce);
+  if (colon < 0) return -1;
+  int comma = resp.indexOf(',', colon + 1);
+  int start = (comma >= 0) ? comma + 1 : colon + 1;
+  int end = resp.indexOf(',', start);
+  int nl = resp.indexOf('\n', start);
+  if (end < 0 || (nl >= 0 && nl < end)) end = nl;
+  if (end < 0) end = resp.length();
+  String stat = resp.substring(start, end);
+  stat.trim();
+  if (!stat.length()) return -1;
+  return stat.toInt();
+}
+
+static bool parseCsqResponse(const String& csq) {
+  int ci = csq.indexOf("+CSQ:");
+  if (ci < 0) return false;
+  int colon = csq.indexOf(':', ci);
+  int comma = csq.indexOf(',', colon);
+  if (colon < 0 || comma <= colon) return false;
+  modemCsq = csq.substring(colon + 1, comma).toInt();
+  modemBer = csq.substring(comma + 1).toInt();   // 逗号后即 <ber>，toInt 自动忽略尾部 \r\nOK
+  modemSignalFresh = true;
+  return true;
+}
+
+static bool sampleSignalFastNow(unsigned long timeout) {
+  String csq = sendATCommand("AT+CSQ", timeout);
+  return parseCsqResponse(csq);
+}
+
+static bool applyConfiguredDataModeOnce(unsigned long activeTimeout, unsigned long inactiveTimeout) {
+  if (config.dataEnabled) {
+    if (config.apn.length() > 0)
+      sendATandWaitOK(("AT+CGDCONT=1,\"IP\",\"" + config.apn + "\"").c_str(), 3000);
+    return sendATandWaitOK("AT+CGACT=1,1", activeTimeout);
+  }
+  return sendATandWaitOK("AT+CGACT=0,1", inactiveTimeout);
+}
+
+static void scheduleDataModeRetry() {
+  dataModeRetryPending = true;
+  dataModeRetryCount = 0;
+  nextDataModeRetryMs = millis() + MODEM_DATA_MODE_RETRY_GAP_MS;
+}
+
 // 新增"模组断电重启"函数
 void modemPowerCycle() {
   if (!beginModemSerialOp("模组断电重启")) return;
+  modemInitPhase = MODEM_INIT_PHASE_POWERING;
+  modemReady = false;
   pinMode(MODEM_EN_PIN, OUTPUT);
 
   logCaptureLn("EN 拉低：关闭模组");
@@ -173,6 +236,17 @@ void resetModule() {
 void modemInit() {
   // 清掉上电噪声/残留
   while (Serial1.available()) Serial1.read();
+  modemReady = false;
+  modemCeregStat = -1;
+  modemSignalFresh = false;
+  modemIdentityFresh = false;
+  modemRegistrationPending = false;
+  registrationCheckCount = 0;
+  postRegisterStep = 0;
+  dataModeRetryPending = false;
+  signalLastFastMs = 0;
+  signalLastDetailMs = 0;
+  modemInitPhase = MODEM_INIT_PHASE_POWERING;
 
   bool atOk = false;
   for (int round = 0; round < 2 && !atOk; round++) {
@@ -189,9 +263,16 @@ void modemInit() {
   if (!atOk) {
     logCaptureLn("模组AT无响应，标记未就绪（健康检查将稍后自动重试）");
     modemReady = false;
+    modemInitPhase = MODEM_INIT_PHASE_FAILED;
     return;
   }
   logCaptureLn("模组AT响应正常");
+  modemInitPhase = MODEM_INIT_PHASE_AT_READY;
+  lastModemOkMs = millis();
+  if (sampleSignalFastNow(1200)) {
+    signalLastFastMs = millis();
+    logCaptureF("首次 CSQ 快速采样: %d\n", modemCsq);
+  }
 
   //判断型号，做一些特定操作
   bool need_set_CGACT = true;
@@ -208,25 +289,14 @@ void modemInit() {
   }
 
   if(need_set_CGACT) {
-    if (config.dataEnabled) {
-      // 用户已在“SIM 卡”页允许蜂窝数据：下发 APN(若填写)并激活 PDP
-      if (config.apn.length() > 0)
-        sendATandWaitOK(("AT+CGDCONT=1,\"IP\",\"" + config.apn + "\"").c_str(), 3000);
-      int tries = 0;
-      while (tries < MODEM_INIT_CMD_RETRIES && !sendATandWaitOK("AT+CGACT=1,1", 10000)) {
-        logCaptureLn("激活数据连接失败，重试...");
-        blink_short();
-        tries++;
-      }
-      logCaptureLn("已按配置启用蜂窝数据(AT+CGACT=1,1)");
+    bool dataModeOk = applyConfiguredDataModeOnce(6000, 2500);
+    if (dataModeOk) {
+      if (config.dataEnabled) logCaptureLn("已按配置启用蜂窝数据(AT+CGACT=1,1)");
+      else logCaptureLn("已禁用数据连接(AT+CGACT=0,1)，防止流量消耗");
     } else {
-      int tries = 0;
-      while (tries < MODEM_INIT_CMD_RETRIES && !sendATandWaitOK("AT+CGACT=0,1", 5000)) {
-        logCaptureLn("设置CGACT失败，重试...");
-        blink_short();
-        tries++;
-      }
-      logCaptureLn("已禁用数据连接(AT+CGACT=0,1)，防止流量消耗");
+      logCaptureLn(config.dataEnabled ? "启动时激活数据连接未成功，转入后台重试" :
+                                       "启动时禁用数据连接未确认，转入后台重试");
+      scheduleDataModeRetry();
     }
   } else {
     logCaptureLn("该型号无法配置(AT+CGACT=0,1)，跳过该命令，会不会消耗流量？自求多福");
@@ -249,28 +319,11 @@ void modemInit() {
                      "设置PDU模式失败，快速重试...",
                      "设置PDU模式暂未成功，交给接收看门狗后台补设");
   requestModemIdentitySample();  // 仅安排一次后台采样；不阻塞注册和开机补短信
-  int ceregRetry = 0;
-  while (!waitCEREG() && ceregRetry < 30) {
-    logCaptureLn("等待网络注册...");
-    ceregRetry++;
-    blink_short();
-  }
-  if (ceregRetry < 30) {
-    logCaptureLn("网络已注册");
-    modemReady = true;
-    lastModemOkMs = millis();
-    // 采样运营商名(开机一次，供首页显示)
-    String cops = sendATCommand("AT+COPS?", 3000);
-    int q1 = cops.indexOf('"');
-    int q2 = cops.indexOf('"', q1 + 1);
-    if (q1 >= 0 && q2 > q1) modemOperator = cops.substring(q1 + 1, q2);
-    if (config.operatorPlmn.length()) modemApplyOperator();  // 仅在用户显式锁定运营商时下发
-    // 详细信号采样交给 signalSampleTick() 分帧执行，避免开机补短信前继续占用串口。
-    if (config.dataEnabled) sampleCellIp();
-  } else {
-    logCaptureLn("网络注册超时（无SIM卡或信号差），模组功能暂不可用");
-    modemReady = false;
-  }
+  modemInitPhase = MODEM_INIT_PHASE_REGISTERING;
+  modemRegistrationPending = true;
+  registrationCheckCount = 0;
+  nextRegistrationCheckMs = millis();
+  logCaptureLn("模组基础初始化完成，网络注册转入后台等待");
 }
 
 bool queryModemImei(String& imeiOut, String* rawResp, unsigned long timeout) {
@@ -362,8 +415,17 @@ static void parseAtiIdentity(const String& ati) {
   if (ver.length() && ver != "未知") modemFwVer = ver;
 }
 
+static void sampleOperatorName() {
+  String cops = sendATCommand("AT+COPS?", 3000);
+  int q1 = cops.indexOf('"');
+  int q2 = cops.indexOf('"', q1 + 1);
+  if (q1 >= 0 && q2 > q1) modemOperator = cops.substring(q1 + 1, q2);
+}
+
 void requestModemIdentitySample() {
-  if (identitySampleDone || identitySampleQueued) return;
+  if (identitySampleQueued) return;
+  identitySampleDone = false;
+  modemIdentityFresh = false;
   identitySampleQueued = true;
   identityStep = 0;
   identityImeiCmdIndex = 0;
@@ -445,6 +507,7 @@ void modemIdentityTick() {
     if (modemImei != identityOldImei || modemIccid != identityOldIccid) saveModemIdentityCache();
     identitySampleQueued = false;
     identitySampleDone = true;
+    modemIdentityFresh = true;
     logCaptureLn("模组身份信息后台采样完成");
   }
 }
@@ -539,10 +602,11 @@ void sampleSignalDetail() {
 // 信号采样调度(与 SMS 接收轮询解耦，避免一次 watchdog tick 串行堆叠多条 AT 造成 ~9s 长阻塞)：
 // CSQ 信号条高频采样(快, 首页数值跟手)；RSRP/SINR/PCI 等详细指标变化慢，低频采样省阻塞。
 void signalSampleTick() {
-  if (!modemReady) return;
+  if (!modemReady && modemInitPhase != MODEM_INIT_PHASE_AT_READY &&
+      modemInitPhase != MODEM_INIT_PHASE_REGISTERING) return;
   if (smsRecvGuardUntil && millis() < smsRecvGuardUntil) return;  // 短信接收窗口内不采样，避免AT清缓冲冲掉URC
   if (smsStoredWorkPending()) return;
-  static unsigned long lastFast = 0, lastDetail = 0, nextDetailStepMs = 0;
+  static unsigned long nextDetailStepMs = 0;
   static uint8_t detailStep = 0;  // 0=空闲, 1=MUESTATS, 2=CESQ回退, 3=CEREG/TAC
   static bool detailNeedCesq = false;
   unsigned long now = millis();
@@ -550,22 +614,14 @@ void signalSampleTick() {
   if (gSlowWorkBusy || forwardQueueDepth() > 0 || emailQueueDepth() > 0 ||
       outgoingSmsQueueDepth() > 0) return;
   if (!modemAtQuietFor(MODEM_BACKGROUND_AT_GAP_MS)) return;
-  bool fastDue = (lastFast == 0) ? (now >= SIGNAL_FAST_FIRST_DELAY_MS) : (now - lastFast >= SIGNAL_FAST_INTERVAL_MS);
+  bool fastDue = (signalLastFastMs == 0) ? (now >= SIGNAL_FAST_FIRST_DELAY_MS) : (now - signalLastFastMs >= SIGNAL_FAST_INTERVAL_MS);
   if (detailStep == 0 && fastDue) {
-    lastFast = now;
-    String csq = sendATCommand("AT+CSQ", 1500);
-    int ci = csq.indexOf("+CSQ:");
-    if (ci >= 0) {
-      int colon = csq.indexOf(':', ci);
-      int comma = csq.indexOf(',', colon);
-      if (colon >= 0 && comma > colon) {
-        modemCsq = csq.substring(colon + 1, comma).toInt();
-        modemBer = csq.substring(comma + 1).toInt();   // 逗号后即 <ber>，toInt 自动忽略尾部 \r\nOK
-      }
-    }
+    signalLastFastMs = now;
+    sampleSignalFastNow(1500);
     return;  // 每帧最多一条 AT，避免信号采样把网页排队时间拉长
   }
-  bool detailDue = (lastDetail == 0) ? (now >= SIGNAL_DETAIL_FIRST_DELAY_MS) : (now - lastDetail >= SIGNAL_DETAIL_INTERVAL_MS);
+  if (!modemReady) return;  // 注册完成前只做 CSQ，详细小区信息等 CEREG 成功后再采
+  bool detailDue = (signalLastDetailMs == 0) ? (now >= SIGNAL_DETAIL_FIRST_DELAY_MS) : (now - signalLastDetailMs >= SIGNAL_DETAIL_INTERVAL_MS);
   if (detailStep == 0 && detailDue) {
     detailStep = 1;
     detailNeedCesq = false;
@@ -581,7 +637,7 @@ void signalSampleTick() {
       detailStep = 3;
     } else {
       parseCeregTac(sendATCommand("AT+CEREG?", 2000));
-      lastDetail = millis();
+      signalLastDetailMs = millis();
       detailStep = 0;
     }
     nextDetailStepMs = millis() + SIGNAL_DETAIL_STEP_GAP_MS;
@@ -620,6 +676,94 @@ void modemApplyDataMode() {
   }
 }
 
+static bool processDataModeRetry() {
+  if (!dataModeRetryPending) return false;
+  if ((int32_t)(millis() - nextDataModeRetryMs) < 0) return false;
+  if (smsUrcReceiving() || smsStoredWorkPending()) return false;
+  if (!modemAtQuietFor(MODEM_BACKGROUND_AT_GAP_MS)) return false;
+
+  dataModeRetryCount++;
+  bool ok = applyConfiguredDataModeOnce(8000, 3000);
+  if (ok) {
+    dataModeRetryPending = false;
+    logCaptureLn(config.dataEnabled ? "后台重试：蜂窝数据已启用" : "后台重试：蜂窝数据已禁用");
+  } else if (dataModeRetryCount >= MODEM_DATA_MODE_RETRY_MAX) {
+    dataModeRetryPending = false;
+    logCaptureLn("后台重试 CGACT 仍失败，保留当前模组状态，后续健康检查继续兜底");
+  } else {
+    nextDataModeRetryMs = millis() + MODEM_DATA_MODE_RETRY_GAP_MS;
+    logCaptureLn("后台重试 CGACT 未成功，稍后再试");
+  }
+  return true;
+}
+
+static void noteNetworkRegistered() {
+  bool firstReady = !modemReady || modemInitPhase != MODEM_INIT_PHASE_READY;
+  if (firstReady) logCaptureLn("网络已注册");
+  modemReady = true;
+  modemInitPhase = MODEM_INIT_PHASE_READY;
+  modemRegistrationPending = false;
+  registrationCheckCount = 0;
+  lastModemOkMs = millis();
+  if (firstReady) postRegisterStep = 1;
+}
+
+// 开机注册后台状态机：把原 setup() 内最长几十秒的 CEREG 等待拆到 loop 里。
+// 每次 tick 最多执行一个 AT 类动作，注册完成后再依次做运营商/IP/暂存短信补收。
+void modemRegistrationTick() {
+  if (processDataModeRetry()) return;
+
+  if (postRegisterStep != 0) {
+    if (smsUrcReceiving() || smsStoredWorkPending()) return;
+    if (lastWebRequestMs != 0 && millis() - lastWebRequestMs < SLOW_WORK_WEB_GRACE_MS) return;
+    if (gSlowWorkBusy || forwardQueueDepth() > 0 || emailQueueDepth() > 0 ||
+        outgoingSmsQueueDepth() > 0) return;
+    if (!modemAtQuietFor(MODEM_BACKGROUND_AT_GAP_MS)) return;
+
+    if (postRegisterStep == 1) {
+      if (config.operatorPlmn.length()) modemApplyOperator();  // 仅在用户显式锁定运营商时下发
+      postRegisterStep = 2;
+      return;
+    }
+    if (postRegisterStep == 2) {
+      sampleOperatorName();
+      postRegisterStep = 3;
+      return;
+    }
+    if (postRegisterStep == 3) {
+      if (config.dataEnabled) sampleCellIp();
+      postRegisterStep = 4;
+      return;
+    }
+    if (postRegisterStep == 4) {
+      backfillStoredSms(true);
+      postRegisterStep = 0;
+      return;
+    }
+  }
+
+  if (!modemRegistrationPending) return;
+  if (smsUrcReceiving()) return;
+  if ((int32_t)(millis() - nextRegistrationCheckMs) < 0) return;
+  if (!modemAtQuietFor(MODEM_BACKGROUND_AT_GAP_MS)) return;
+
+  if (waitCEREG()) {
+    noteNetworkRegistered();
+    return;
+  }
+
+  registrationCheckCount++;
+  if (registrationCheckCount >= MODEM_REG_MAX_CHECKS) {
+    modemRegistrationPending = false;
+    modemInitPhase = MODEM_INIT_PHASE_FAILED;
+    modemReady = false;
+    logCaptureLn("网络注册后台等待超时（无SIM卡或信号差），后续健康检查继续恢复");
+  } else {
+    nextRegistrationCheckMs = millis() + MODEM_REG_CHECK_INTERVAL_MS;
+    logCaptureLn("等待网络注册...");
+  }
+}
+
 // 模组健康探测：loop() 周期调用。仅在"距上次确认存活已超过探测周期"时才主动发
 // AT+CEREG? —— 任何收到的串口行(含短信URC)都会刷新 lastModemOkMs(见 checkSerial1URC)，
 // 因此有真实短信流量或近期 AT 操作时不会主动探测，最大限度降低探测 AT 抢占到达短信 URC 的概率。
@@ -628,14 +772,16 @@ void modemHealthTick() {
   static int failCount = 0;
   static bool inTick = false;
   if (inTick) return;                                   // 防重入（恢复期间 modemInit 会 pump handleClient）
+  if (modemInitPhase == MODEM_INIT_PHASE_POWERING ||
+      modemInitPhase == MODEM_INIT_PHASE_AT_READY ||
+      modemInitPhase == MODEM_INIT_PHASE_REGISTERING) return;  // 注册中由 modemRegistrationTick 负责
   if (millis() - lastModemOkMs < MODEM_HEALTH_INTERVAL_MS) return;
   if (lastWebRequestMs != 0 && millis() - lastWebRequestMs < SLOW_WORK_WEB_GRACE_MS) return;
   if (!modemAtQuietFor(MODEM_BACKGROUND_AT_GAP_MS)) return;
   inTick = true;
 
   if (waitCEREG()) {
-    modemReady = true;
-    lastModemOkMs = millis();
+    noteNetworkRegistered();
     failCount = 0;
   } else {
     failCount++;
@@ -667,8 +813,9 @@ bool sendATandWaitOK(const char* cmd, unsigned long timeout) {
 // 检测网络注册状态（LTE/4G）。CEREG状态: 1=已注册本地, 5=已注册漫游，其余(0/2/3/4)视为未注册
 bool waitCEREG() {
   String resp = sendATCommand("AT+CEREG?", 2000);
-  if (resp.indexOf("+CEREG:") < 0) return false;
-  return resp.indexOf(",1") >= 0 || resp.indexOf(",5") >= 0;
+  modemCeregStat = parseCeregStatValue(resp);
+  if (modemCeregStat < 0) return false;
+  return modemCeregStat == 1 || modemCeregStat == 5;
 }
 
 // 发送短信（PDU模式）

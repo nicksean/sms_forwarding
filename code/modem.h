@@ -7,6 +7,7 @@ String sendATCommand(const char* cmd, unsigned long timeout);
 void modemPowerCycle();
 void resetModule();
 void modemInit();
+void modemRegistrationTick(); // loop() 中非阻塞等待 CEREG 注册，注册完成后触发补收/信息采样
 void modemHealthTick();  // loop() 中按周期探测模组健康，连续失败自动断电恢复
 bool queryModemImei(String& imeiOut, String* rawResp = nullptr, unsigned long timeout = 2000); // 查询一次 IMEI，按常见命令顺序回退
 void requestModemIdentitySample(); // 安排开机一次性后台采样 IMEI/ICCID/IMSI/APN 等

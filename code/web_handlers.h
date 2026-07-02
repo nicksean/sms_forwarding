@@ -17,6 +17,9 @@ void logCaptureLn(const char* msg);
 
 bool checkAuth(bool markActivity = true);
 void handleRoot();
+void handleWebAsset();    // gzip 静态资源: /assets/app.css / /assets/app.js
+void handleUiPanel();     // gzip 懒加载面板: /ui?panel=
+void handleConfigJson();  // Web 表单配置 JSON
 void handleToolsPage();
 void handleSave();
 void handleFlightMode();

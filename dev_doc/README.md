@@ -61,7 +61,8 @@ code/
 ├── push.h / .cpp         # 多通道推送、邮件通知、加密工具函数
 ├── sms_process.h / .cpp  # 短信解析、长短信合并、黑名单、管理员命令
 ├── web_handlers.h / .cpp # HTTP 请求处理器 + 日志环形缓冲区
-├── web_html.h / .cpp     # SPA HTML 页面模板（单页 10 个面板）
+├── web_assets.h / .cpp   # 由 web_src 生成的 gzip Web 资源
+├── web_src/              # 可维护的 Web UI 源文件（shell/CSS/JS/panels）
 └── wifi_config.h         # WiFi SSID/密码（宏定义）
 ```
 
@@ -125,8 +126,8 @@ pushWorkerTask() 任务（后台，慢速 TLS/SMTP，不阻塞 loop）
 - **PDU 模式** 而非 Text 模式：中文短信必须使用 PDU 编码
 - **CGACT 默认关闭**：启动时主动禁用 4G 数据连接，避免意外流量消耗（保号/诊断会临时激活）
 - **NVS 持久化**：所有配置存储在 ESP32 非易失存储中，断电不丢失
-- **单页应用 (SPA)**：Web UI 采用侧边栏 + 面板切换，所有功能在一个 HTML 页面中，通过 JS 切换可见面板
+- **压缩 SPA**：Web UI 采用 gzip shell + 缓存 CSS/JS + 懒加载面板；动态配置由 `/config.json` 填充
 - **日志行缓冲**：`logCapture()` 将输出追加到行缓冲区，仅 `logCaptureLn()` 提交整行到环形缓冲区，避免非换行输出被误拆成多行
 - **日志环形缓冲区**：120 行容量，循环覆盖，通过 `/log` 端点以 JSON 返回，Web 端每 2 秒自动刷新
 - **模块化设计**：每个 .h/.cpp 对承担单一职责，便于增减功能和问题定位
-- **HTML 模板分离**：HTML 字符串常量单独存于 `web_html.cpp`，便于 UI 修改而不影响逻辑代码
+- **Web 资源生成**：编辑 `code/web_src/` 后运行 `python tools/build_web_assets.py`，生成 `web_assets.cpp`

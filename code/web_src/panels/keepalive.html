@@ -1,0 +1,57 @@
+<div class="panel" id="panel-keepalive">
+      <h1 class="page-title">定时任务</h1>
+      <p class="page-subtitle">SIM 保号、定时重启与每日心跳</p>
+      <form action="/save" method="POST" class="schedule-form">
+      <input type="hidden" name="kaForm" value="1">
+      <input type="hidden" name="schedForm" value="1">
+      <div class="schedule-grid">
+        <div class="card">
+          <div class="card-header">保号设置<span class="schedule-tag">HTTP payload</span></div>
+          <div class="card-body">
+            <label class="schedule-switch"><input type="checkbox" id="kaEnabled" name="kaEnabled"> 启用保号定时</label>
+            <div class="schedule-status" id="kaCountdown">距下次保号: --</div>
+            <div class="form-row">
+              <div class="form-group">
+                <label class="form-label">触发周期（天）</label>
+                <input class="form-input" type="number" id="kaIntervalDays" name="kaIntervalDays" value="175">
+                <p class="form-hint">建议小于运营商要求天数（如 giffgaff 180 天则设 175）</p>
+              </div>
+              <div class="form-group">
+                <label class="form-label">动作</label>
+                <select class="form-select" id="kaAction" name="kaAction">
+                  <option value="1">蜂窝 HTTP 下载 payload</option>
+                  <option value="2">发送短信</option>
+                  <option value="3">USSD 查询</option>
+                </select>
+              </div>
+            </div>
+            <div class="form-group"><label class="form-label">保号 URL（HTTP 下载 payload）</label><input class="form-input" type="url" id="kaUrl" name="kaUrl" placeholder="http://gg.incrafttime.top/api/payload?size=64342"></div>
+            <div class="form-group"><label class="form-label">目标（短信号码 / USSD 码；HTTP保号时留空）</label><input class="form-input" type="text" id="kaTarget" name="kaTarget" placeholder="如 10086 或 *122#"></div>
+          </div>
+        </div>
+        <div class="schedule-stack">
+          <div class="card schedule-actions">
+            <div class="card-header">手动操作</div>
+            <div class="card-body">
+              <div class="btn-row"><button type="button" class="btn btn-secondary" onclick="kaRun()">立即执行一次</button><button type="button" class="btn btn-secondary" onclick="kaReset()">重置基准日为今天</button></div>
+              <p class="form-hint">“立即执行”触发一次动作并把基准日更新为今天；“重置基准日”只更新计时</p>
+              <div class="result-box" id="kaResult"></div>
+            </div>
+          </div>
+          <div class="card">
+            <div class="card-header">定时重启 / 每日心跳</div>
+            <div class="card-body">
+              <div class="form-row">
+                <div class="form-group"><label class="form-label"><input type="checkbox" name="rebootEnabled" %RB_CHECKED%> 每日定时重启</label><input class="form-input" type="number" name="rebootHour" value="%RB_HOUR%" min="0" max="23"></div>
+                <div class="form-group"><label class="form-label"><input type="checkbox" name="hbEnabled" %HB_CHECKED%> 每日心跳通知（邮件）</label><input class="form-input" type="number" name="hbHour" value="%HB_HOUR%" min="0" max="23"></div>
+              </div>
+              <p class="form-hint">小时按本地时间 0-23 执行；定时重启建议放在空闲时段</p>
+            </div>
+          </div>
+        </div>
+      </div>
+      <button type="submit" class="btn btn-primary btn-block btn-save">保存配置</button>
+      </form>
+    </div>
+
+    <!-- ===== Diagnostics & Control ===== -->
