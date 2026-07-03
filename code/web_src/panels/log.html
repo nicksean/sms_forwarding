@@ -1,17 +1,18 @@
 <div class="panel" id="panel-log">
       <h1 class="page-title">系统日志</h1>
-      <p class="page-subtitle">实时查看设备串口日志输出</p>
+      <p class="page-subtitle">实时查看设备运行日志</p>
       <div class="card">
         <div class="card-header">日志输出</div>
         <div class="card-body">
-          <div id="logView" style="background:#1e1e1e;color:#d4d4d4;padding:12px;border-radius:8px;font-family:'Cascadia Code','Fira Code',Consolas,monospace;font-size:12px;line-height:1.6;max-height:60vh;overflow-y:auto;white-space:pre-wrap;word-break:break-all;min-height:300px;">加载中...</div>
-          <div class="btn-row" style="margin-top:8px;">
+          <div id="logView">加载中...</div>
+          <div class="log-toolbar">
             <button class="btn btn-secondary btn-sm" onclick="clearLogUI()">清空显示</button>
-            <button class="btn btn-secondary btn-sm" onclick="refreshLog()">手动刷新</button>
+            <button class="btn btn-secondary btn-sm" onclick="reloadLog()">重新加载</button>
             <button class="btn btn-secondary btn-sm" onclick="location.href='/logdownload'">下载日志</button>
-            <label style="margin-left:8px;font-size:13px;cursor:pointer;"><input type="checkbox" id="logAuto" checked onchange="toggleLogAuto()"> 自动刷新</label>
+            <label class="log-auto"><input type="checkbox" id="logAuto" checked onchange="toggleLogAuto()"> 自动刷新</label>
           </div>
-          <p class="form-hint">显示设备运行时输出的日志信息，每2秒自动刷新。设备端保留最近 200 条，可“下载日志”导出全部。</p>
+          <div class="log-status" id="logStatus"></div>
+          <p class="form-hint">每2秒自动刷新；设备端保留最近 120 条，本页打开期间最多显示 500 条，可“下载日志”导出当前保留内容。</p>
         </div>
       </div>
     </div>

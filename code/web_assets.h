@@ -1,7 +1,8 @@
 #ifndef WEB_ASSETS_H
 #define WEB_ASSETS_H
 
-#include <Arduino.h>
+#include <stddef.h>
+#include <stdint.h>
 
 struct WebAsset {
   const uint8_t* data;
@@ -15,6 +16,6 @@ extern const WebAsset WEB_INDEX;
 extern const WebAsset WEB_APP_CSS;
 extern const WebAsset WEB_APP_JS;
 
-const WebAsset* findWebPanelAsset(const String& name);
+const WebAsset* findWebPanelAsset(const char* name);
 
 #endif

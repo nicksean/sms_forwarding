@@ -1,49 +1,43 @@
-name: Build Arduino Firmware
+name: Build ESP-IDF Firmware
 
 on:
   push:
     paths:
-      - 'code/**'
+      - 'main/**'
+      - 'components/**'
+      - 'code/web_src/**'
       - 'tools/**'
+      - 'CMakeLists.txt'
+      - 'sdkconfig.defaults'
+      - 'partitions_ota_1m9.csv'
+      - '.github/workflows/build.yml'
   pull_request:
   workflow_dispatch:
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    
+    container: espressif/idf:release-v5.5
+
     steps:
-    - name: Checkout repository
-      uses: actions/checkout@v6
-    
-    - name: Setup Arduino CLI
-      uses: arduino/setup-arduino-cli@v2
-    
-    - name: Install ESP32 platform
-      run: |
-        arduino-cli config init
-        arduino-cli config add board_manager.additional_urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
-        arduino-cli core update-index
-        arduino-cli core install esp32:esp32
-    
-    - name: Install dependencies
-      run: |
-        arduino-cli lib install "pdulib"
-        arduino-cli lib install "ReadyMail"
+      - name: Checkout repository
+        uses: actions/checkout@v6
 
-    - name: Verify generated web assets
-      run: |
-        python tools/build_web_assets.py --check
-    
-    - name: Compile firmware
-      run: |
-        arduino-cli compile --fqbn esp32:esp32:esp32c3:PartitionScheme=min_spiffs,CDCOnBoot=cdc --output-dir build ./code
+      - name: Verify generated web assets
+        run: python tools/build_web_assets.py --check
 
-    - name: Upload firmware artifact (7-day retention)
-      uses: actions/upload-artifact@v4
-      with:
-        name: firmware-bin
-        path: |
-          build/*.ino.bin
-          build/*.merged.bin
-        retention-days: 7
+      - name: Build firmware
+        shell: bash
+        run: |
+          . "$IDF_PATH/export.sh"
+          idf.py -B build/idf -D SDKCONFIG=build/sdkconfig build
+
+      - name: Upload firmware artifact (7-day retention)
+        uses: actions/upload-artifact@v4
+        with:
+          name: esp-idf-firmware-bin
+          path: |
+            build/idf/sms_forwarding_idf.bin
+            build/idf/bootloader/bootloader.bin
+            build/idf/partition_table/partition-table.bin
+          retention-days: 7

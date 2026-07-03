@@ -2,129 +2,67 @@
 
 This file provides guidance to Codex (Codex.ai/code) when working with code in this repository.
 
-## What this is
+## What This Is
 
-ESP32-C3 firmware (Arduino framework) for a low-cost SMS forwarder. A 4G/LTE modem
-(ML307R-DC) receives SMS over UART/AT; the ESP32-C3 decodes PDU, then forwards the
-message over WiFi to email (SMTP) and up to 5 simultaneous push channels, and serves a
-web UI for config/diagnostics. Receive-only by design — multi-SIM, calls, dialing, and
-open APIs are explicitly out of scope (see README).
+ESP32-C3 firmware for a low-cost SMS forwarder. A 4G/LTE modem (ML307R-DC) receives SMS over UART/AT; the ESP32-C3 decodes PDU, then forwards the message over WiFi to email (SMTP) and up to 5 simultaneous push channels, and serves a web UI for config/diagnostics.
 
-All source lives in `code/` as a single Arduino sketch. Inline doc/comments are in Chinese;
-keep that convention when editing.
+The firmware is now native **ESP-IDF only**. The former Arduino fallback sketch has been removed. Keep inline docs/comments in Chinese when editing source files.
 
-## Build / flash / monitor
+## Build / Flash / Monitor
 
-Board FQBN: `esp32:esp32:makergo_c3_supermini` (or `esp32:esp32:esp32c3` as CI uses).
-Toolchain: arduino-cli. Required libraries: **pdulib** (PDU SMS codec) and **ReadyMail**
-(SMTP), plus the ESP32 Arduino core (3.x).
+Local ESP-IDF helper:
 
 ```powershell
-# Build (Windows / arduino-cli) — keep all paths ASCII-only; Chinese paths break compilation
-arduino-cli compile --fqbn esp32:esp32:makergo_c3_supermini --build-path "<ascii-build-dir>" "<repo>\code"
-
-# Flash over USB CDC (device shows as a COM port, e.g. COM4)
-arduino-cli upload --fqbn esp32:esp32:makergo_c3_supermini --port COM4 --input-dir "<ascii-build-dir>" "<repo>\code"
-
-# Serial monitor (logs at 115200)
-arduino-cli monitor --port COM4 --config 115200
+powershell -ExecutionPolicy Bypass -File tools\idf.ps1 build
+powershell -ExecutionPolicy Bypass -File tools\idf.ps1 flash -Port COM5
+powershell -ExecutionPolicy Bypass -File tools\idf.ps1 monitor -Port COM5
 ```
 
-If upload fails: hold BOOT, tap RESET, release BOOT, retry. On-device verification is manual via
-the serial monitor and the web UI. CI (`.github/workflows/build.yml`) only compiles on changes
-under `code/**`.
+The helper loads ESP-IDF 5.5.4, uses Ninja parallelism, and writes generated build files under `build/`.
 
-**Host unit tests** (`test/`): portable pure-logic helpers live in `code/sms_logic.h` and are
-unit-tested natively with g++ (no Arduino/pdulib deps) via a small `String` shim. Run on a dev box:
-`./test/run.sh` (or `test/run.ps1`). Add a case in `test/run_tests.cpp` whenever you add/extend a
-pure helper in `sms_logic.h`. PDU decode, AT state machines, and WebServer streaming can't be
-host-tested — verify those on device.
+Before committing Web UI changes, run:
 
-`code/wifi_config.h` (gitignored, holds plaintext creds — never commit) defines `WIFI_SSID`/
-`WIFI_PASS`. These are now only a **fallback/seed**: WiFi creds are stored in NVS
-(`config.wifiSsid/wifiPass`) and editable from the web UI's **WiFi 设置** panel. Resolution order:
-NVS creds → wifi_config.h macro → if both empty (or STA connect fails), the device starts a
-**provisioning SoftAP** (`SMS-Forwarder-<mac>`, open, captive portal via DNSServer) so you connect
-to it and configure WiFi at `192.168.4.1`. So wifi_config.h may be left with empty strings for a
-pure web-provisioned setup; it still must define the macros for compilation. Saving WiFi in the web
-UI persists to NVS and reboots to connect.
+```powershell
+python tools\build_web_assets.py
+python tools\build_web_assets.py --check
+```
+
+CI builds the ESP-IDF firmware via `.github/workflows/build.yml`.
 
 ## Architecture
 
-Standard single-threaded Arduino model: everything runs serially in `loop()`, no RTOS tasks.
-`loop()` each frame: `server.handleClient()` → invalid-config IP print → `checkConcatTimeout()`
-→ USB↔modem AT passthrough → `checkSerial1URC()`. Keep per-frame work non-blocking.
+Project entrypoints:
 
-`loop()` also runs (non-blocking, millis-gated): `wifiEnsureConnected()` (reconnect), `modemHealthTick()`
-(AT+CEREG probe + auto power-cycle recovery), `processRetryQueue()` (push retry), `heapGuardTick()`
-(low-heap orderly restart), `keepAliveTick()` (SIM keep-alive), and a `yield()`.
+- `CMakeLists.txt`, `main/`, and `components/` are the ESP-IDF firmware.
+- `components/idf_modem` owns UART1 and all modem AT traffic.
+- `components/idf_sms` handles PDU SMS receive/send, SIM storage polling, multipart merge, dedup, blacklist/admin commands, and enqueueing forwards.
+- `components/idf_push` owns HTTP/HTTPS push, SMTP, forward queues, retry queues, test push, and forward-rule evaluation.
+- `components/idf_web` owns `esp_http_server`, all Web/API routes, scheduler, keep-alive jobs, OTA upload, diagnostics, and status JSON.
+- `components/idf_wifi` owns STA/SoftAP provisioning, captive DNS, lightweight mDNS, SNTP, reconnect watchdog, and BOOT long-press provisioning.
+- `components/idf_config` persists config in NVS namespace `sms_config`; old NVS keys remain additive/compatible.
+- `components/web_assets` links generated gzip Web assets from `code/web_assets.cpp`; editable sources live in `code/web_src/`.
 
-Module layering (`#include` direction, bottom → top):
-`config_types.h` (enums/structs/constants + tunable `#define`s, no deps) → `sms_logic.h`
-(header-only inline pure helpers: json/url/html escape, phone mask, blacklist match, fnv1a dedup,
-keep-alive due-date, OTP, backoff, `streamTemplate`; host-tested) → `globals.h/.cpp` (extern globals
-+ shared includes; includes `sms_logic.h` once for all modules) → feature modules (`config`, `modem`,
-`push`, `sms_process`, `scheduler`, `web_handlers`, `web_assets`(generated)) → `code.ino` (`setup()` + `loop()`).
-Detailed per-file guide: `dev_doc/module_details.md`; data-flow diagrams: `dev_doc/architecture.md`.
+Slow work must stay off request handlers where possible: use existing worker queues for push/email/modem/keep-alive work so SMS receive and Web refresh stay responsive.
 
-Key flows:
-- **SMS receive** (`sms_process.cpp`): `checkSerial1URC()` reads `Serial1` line-by-line, detects
-  `+CMT:`, feeds the hex PDU to `pdu.decodePDU()`. Multipart (long) SMS is buffered per ref-number
-  in `concatBuffer` (5 slots × 10 parts) and merged when complete, or force-forwarded after a 30s
-  timeout. Assembled text goes to `processSmsContent()` → blacklist filter → admin-command check →
-  `sendSMSToServer()` + `sendEmailNotification()`.
-- **Push** (`push.cpp`): `sendToChannel()` is a `switch(channel.type)` over `PushType` (1–10:
-  POST JSON, Bark, GET, DingTalk, PushPlus, ServerChan, Custom template, Feishu, Gotify, Telegram).
-  DingTalk/Feishu HMAC-SHA256 signing uses ESP32's built-in `mbedtls_md`.
-- **Web** (`web_handlers.cpp` + `web_src/*` + generated `web_assets.cpp`): gzip-compressed SPA
-  shell plus lazy-loaded panels/CSS/JS. All routes behind HTTP Basic Auth (`config.webUser/webPass`,
-  default `admin`/`admin123`). `handleRoot()` sends the small gzip shell from PROGMEM; `/assets/*`
-  and `/ui?panel=` serve pre-gzipped assets with browser cache headers; `/config.json` supplies
-  dynamic form values for `%PLACEHOLDER%` tokens client-side. Routes: `/`,`/assets/app.css`,
-  `/assets/app.js`,`/ui`,`/config.json`,`/save`,`/sendsms`,`/ping`,`/query`,
-  `/flight`,`/at`,`/log`(streamed, `?since=` cursor),`/modem`,`/wifi`,`/status`(health JSON),
-  `/keepalive`,`/testpush`,`/ussd`. Sidebar icons are inline SVG (no emoji).
-- **Scheduler** (`scheduler.cpp`): E0 SIM keep-alive — absolute-date (NVS `kaLastTime`), power-loss
-  safe; action = cellular HTTP payload/SMS/USSD; `keepAliveTick()` in loop,
-  `/keepalive?action=status|run|reset`. The payload URL is persisted in `config.kaUrl` and is also
-  used by the diagnostics `/ping` route; the modem performs the HTTP GET over PDP via `AT+MHTTP*`.
-- **Config** (`config.cpp`): persisted to NVS via `Preferences`, namespace `sms_config`.
-  `loadConfig()` migrates legacy single-channel keys (`httpUrl`, `barkMode`) into `pushChannels[0]`.
-  New keys are additive with defaults (zero-migration). Tunable defaults (timeouts, queue size,
-  retry backoff, modem-health interval, low-heap threshold, dedup window) live atop `config_types.h`.
-- **Privacy/logging**: SMS body + phone numbers are masked in the (web-visible) log ring buffer by
-  default (`maskPhone`/`bodyPreview`); full content only when compiled with `-DSMS_LOG_VERBOSE=1`.
+## Web UI Assets
 
-## Conventions when extending
+Editable UI files live in `code/web_src/`:
 
-- **New push channel**: add to `PushType` enum (config_types.h) → add validation in
-  `isPushChannelValid()` → add a `case` in `sendToChannel()` → add the `<option>` + JS hint in the
-  web UI. `MAX_PUSH_CHANNELS` is 5.
-- **New config field**: add to `Config` struct → read (with default) in `loadConfig()` → write in
-  `saveConfig()` → parse from the form in `handleSave()`. Keep keys additive (default-valued) so
-  upgrades need no migration.
-- **New HTTP route**: add a handler in web_handlers.cpp → declare in web_handlers.h → register with
-  `server.on()` in `setup()`. For large/dynamic responses prefer chunked `server.sendContent()`
-  (set `CONTENT_LENGTH_UNKNOWN`, end with `sendContent("")`) over building one big `String`.
-- **New page placeholder**: add a `%TOKEN%` in the relevant `code/web_src/panels/*.html` file →
-  add it to `renderConfigTemplate()` in `code/web_src/app.js` and include any needed field in
-  `/config.json`. After editing `web_src`, run `python tools/build_web_assets.py`.
-- **New pure/portable logic**: put it in `sms_logic.h` (inline, depends only on `String`+libc) and
-  add a host test in `test/run_tests.cpp` so it's verifiable without hardware.
-- **Logging**: use `logCapture()` to append to the current line buffer and `logCaptureLn()` /
-  `logCaptureF("...\n")` to commit a full line to the 120-entry ring buffer (also mirrored to
-  `Serial`). Don't commit partial lines — that's why the line buffer exists.
-- **Modem init order matters**: AT setup (handshake → `AT+CGACT=0,1` to disable data and avoid
-  traffic charges → `AT+CNMI` URC reporting → `AT+CMGF=0` PDU mode → wait for CEREG registration)
-  must complete before WiFi. PDU mode (not Text) is required for Chinese SMS. The `modemPowerCycle()`
-  EN-pin timing (`MODEM_POWERUP_MS`/`MODEM_POWERDOWN_MS` in config_types.h, default 6000/1200) is
-  tuned for ML307R-DC — when swapping modems retune those defines. Pins: TXD=GPIO3, RXD=GPIO4,
-  modem EN=GPIO5, LED=GPIO8.
-- **Modem compatibility**: the whole ML307 family (ML307R / ML307A / "DC" variants) shares the same
-  China-Mobile AT command set, so PDU SMS / CNMI / CMGL / CMGS / CMGD / CEREG / CUSD all work
-  unchanged. The only model branch is `if (model == "ML307Y") need_set_CGACT = false`. Connect via
-  the modem's **UART** pads (not its USB connector) and wire the EN/power pad to GPIO5 for hardware
-  power-cycle recovery (soft `AT+CFUN=1,1` reset works even without it).
-- **Receive robustness**: reception uses both the `+CMT` URC path AND a 60s `AT+CMGL` storage poll
-  (`smsReceiveWatchdogTick`) that re-asserts CNMI — this is what prevents the "after ~3 days only
-  outbound works" failure when the modem drops URC routing. fnv1a dedup makes the dual path safe.
+- `index.html`
+- `app.css`
+- `app.js`
+- `panels/*.html`
+
+Generated assets are `code/web_assets.h` and `code/web_assets.cpp`. Do not hand-edit generated assets; run `python tools/build_web_assets.py` after editing `web_src`.
+
+New page placeholder flow: add `%TOKEN%` in a panel, render it in `code/web_src/app.js`, expose any dynamic value from `/config.json`, then regenerate assets.
+
+## Extension Conventions
+
+- **New push channel**: add type handling in `components/idf_push/idf_push.cpp`, add validation, then add the Web UI option and hint in `code/web_src/app.js`. `IDF_MAX_PUSH_CHANNELS` is 5.
+- **New config field**: add to `IdfConfig`, load/save it in `components/idf_config/idf_config.cpp`, expose/parse it in Web config handlers, and keep the key additive with a default.
+- **New HTTP route**: add a handler in `components/idf_web/idf_web.cpp`, register it in `idf_web_start()`, and prefer bounded/streaming responses over large one-shot strings.
+- **Logging**: use `idf_log_line()` / `idf_logf()` for Web-visible logs. Logs are mirrored into the 120-entry ring buffer.
+- **Privacy**: SMS body and phone numbers should remain masked in normal logs; full content belongs only behind explicit verbose/debug builds.
+- **Modem order matters**: handshake, disable/enable data per config via `CGACT`, configure storage/CNMI/PDU mode, then wait for CEREG. PDU mode is required for Chinese SMS.
+- **Receive robustness**: keep both URC receive and periodic `AT+CMGL` storage polling. Dedup makes the dual path safe.

@@ -1,0 +1,743 @@
+#include "idf_wifi.h"
+
+#include <stdio.h>
+#include <string.h>
+#include <sys/time.h>
+#include <time.h>
+#include <unistd.h>
+
+#include <algorithm>
+#include <atomic>
+#include <vector>
+
+#include "driver/gpio.h"
+#include "esp_err.h"
+#include "esp_event.h"
+#include "esp_log.h"
+#include "esp_mac.h"
+#include "esp_netif.h"
+#include "esp_timer.h"
+#include "esp_wifi.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/event_groups.h"
+#include "freertos/semphr.h"
+#include "freertos/task.h"
+#include "idf_log.h"
+#include "apps/esp_sntp.h"
+#include "lwip/inet.h"
+#include "lwip/sockets.h"
+
+static const char* TAG = "idf_wifi";
+static constexpr EventBits_t WIFI_CONNECTED_BIT = BIT0;
+static constexpr EventBits_t WIFI_FAIL_BIT = BIT1;
+static constexpr int WIFI_CONNECT_TIMEOUT_MS = 20000;
+static constexpr const char* AP_SSID_PREFIX = "SMS-Forwarder-";
+static constexpr gpio_num_t PROVISION_BUTTON_PIN = GPIO_NUM_9;
+static constexpr uint32_t PROVISION_BUTTON_HOLD_MS = 5000;
+static constexpr uint16_t WIFI_SCAN_RECORD_LIMIT = 40;
+
+static EventGroupHandle_t s_wifi_event_group = nullptr;
+static SemaphoreHandle_t s_state_mutex = nullptr;
+static esp_netif_t* s_sta_netif = nullptr;
+static esp_netif_t* s_ap_netif = nullptr;
+static std::atomic<bool> s_started{false};
+static bool s_ap_mode = false;
+static bool s_ap_manual_mode = false;
+static std::atomic<bool> s_has_sta_credentials{false};
+static std::atomic<bool> s_sta_configured{false};
+static std::string s_ap_ssid;
+static std::atomic<bool> s_dns_task_started{false};
+static std::atomic<bool> s_mdns_task_started{false};
+static std::atomic<bool> s_button_task_started{false};
+static std::atomic<bool> s_sntp_started{false};
+static std::atomic<bool> s_sta_connected{false};
+static std::atomic<int> s_disconnect_streak{0};
+static esp_timer_handle_t s_reconnect_timer = nullptr;
+static char s_ntp_server[128] = "ntp.aliyun.com";
+
+static esp_err_t start_provisioning_ap(bool manual = false);
+
+struct ApState {
+    bool mode = false;
+    bool manual = false;
+    std::string ssid;
+};
+
+static ApState ap_state_snapshot()
+{
+    ApState state;
+    if (s_state_mutex && xSemaphoreTake(s_state_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        state.mode = s_ap_mode;
+        state.manual = s_ap_manual_mode;
+        state.ssid = s_ap_ssid;
+        xSemaphoreGive(s_state_mutex);
+    }
+    return state;
+}
+
+static void set_ap_state(bool mode, bool manual, const std::string& ssid)
+{
+    if (s_state_mutex && xSemaphoreTake(s_state_mutex, pdMS_TO_TICKS(200)) == pdTRUE) {
+        s_ap_mode = mode;
+        s_ap_manual_mode = manual;
+        s_ap_ssid = ssid;
+        xSemaphoreGive(s_state_mutex);
+    }
+}
+
+static bool sta_can_connect()
+{
+    return s_has_sta_credentials.load(std::memory_order_relaxed) &&
+           s_sta_configured.load(std::memory_order_relaxed);
+}
+
+static std::string format_epoch_local(time_t epoch, int tz_offset_min)
+{
+    if (epoch < 1700000000) return {};
+    time_t shifted = epoch + static_cast<time_t>(tz_offset_min) * 60;
+    struct tm tmv = {};
+    gmtime_r(&shifted, &tmv);
+    char buf[40];
+    snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d",
+             tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday,
+             tmv.tm_hour, tmv.tm_min, tmv.tm_sec);
+    return std::string(buf);
+}
+
+static void sntp_sync_cb(timeval*)
+{
+    time_t now = time(nullptr);
+    IdfConfig cfg = idf_config_get();
+    std::string local = format_epoch_local(now, cfg.tzOffsetMin);
+    if (local.empty()) {
+        idf_logf("NTP 时间同步成功，epoch=%ld", static_cast<long>(now));
+    } else {
+        idf_logf("NTP 时间同步成功：%s (epoch=%ld)", local.c_str(), static_cast<long>(now));
+    }
+}
+
+static void start_sntp_once()
+{
+    bool expected = false;
+    if (!s_sntp_started.compare_exchange_strong(expected, true, std::memory_order_relaxed)) return;
+
+    IdfConfig cfg = idf_config_get();
+    std::string server = cfg.ntpServer.empty() ? "ntp.aliyun.com" : cfg.ntpServer;
+    strlcpy(s_ntp_server, server.c_str(), sizeof(s_ntp_server));
+
+    esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
+    esp_sntp_set_time_sync_notification_cb(sntp_sync_cb);
+    esp_sntp_setservername(0, s_ntp_server);
+    // 备用服务器：单一 NTP 不可达时时间永远不同步，会连锁禁用所有按时间调度的任务
+    // (需要 CONFIG_LWIP_SNTP_MAX_SERVERS>=3，见 sdkconfig.defaults)
+    esp_sntp_setservername(1, "ntp.ntsc.ac.cn");
+    esp_sntp_setservername(2, "pool.ntp.org");
+    esp_sntp_init();
+    idf_logf("NTP 时间同步已启动：首选=%s，备用=ntp.ntsc.ac.cn,pool.ntp.org", s_ntp_server);
+}
+
+static std::string ip4_to_string(const esp_ip4_addr_t& addr)
+{
+    char buf[16];
+    snprintf(buf, sizeof(buf), IPSTR, IP2STR(&addr));
+    return std::string(buf);
+}
+
+static std::string mac_to_string(const uint8_t mac[6])
+{
+    char buf[18];
+    snprintf(buf, sizeof(buf), "%02X:%02X:%02X:%02X:%02X:%02X",
+             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    return std::string(buf);
+}
+
+static void wifi_event_handler(void*, esp_event_base_t event_base, int32_t event_id, void* event_data)
+{
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
+        if (sta_can_connect()) esp_wifi_connect();
+        return;
+    }
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        s_sta_connected.store(false, std::memory_order_relaxed);
+        if (s_wifi_event_group) xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
+        // 前几次断开立即重连(快速恢复瞬断)；持续失败后退避，交给 15s 看门狗定时器，
+        // 避免错误密码/信号差时无间隔连接风暴打断配网 AP 和 WiFi 扫描
+        int streak = s_disconnect_streak.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (streak <= 3 && sta_can_connect()) {
+            esp_wifi_connect();
+            ESP_LOGW(TAG, "STA 断开，立即重连(第%d次)", streak);
+        } else {
+            ESP_LOGW(TAG, "STA 连续断开%d次，转入定时重连", streak);
+        }
+        return;
+    }
+    if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        auto* event = static_cast<ip_event_got_ip_t*>(event_data);
+        s_sta_connected.store(true, std::memory_order_relaxed);
+        s_disconnect_streak.store(0, std::memory_order_relaxed);
+        ESP_LOGI(TAG, "STA 已获取 IP: " IPSTR, IP2STR(&event->ip_info.ip));
+        idf_logf("WiFi 已连接，IP=" IPSTR, IP2STR(&event->ip_info.ip));
+        start_sntp_once();
+        if (s_wifi_event_group) xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+        ApState ap = ap_state_snapshot();
+        if (ap.mode && !ap.manual && s_has_sta_credentials.load(std::memory_order_relaxed)) {
+            if (esp_wifi_set_mode(WIFI_MODE_STA) == ESP_OK) {
+                set_ap_state(false, false, std::string());
+                idf_log_line("STA 已恢复连接，已关闭配网热点");
+            }
+        }
+    }
+}
+
+// 15s 周期重连看门狗：事件链(断开→重连)任何一环失败(如扫描期间 esp_wifi_connect
+// 返回错误)都不会再有新事件，仅靠事件驱动设备会永久离线。这里兜底补发连接。
+static void reconnect_watchdog_cb(void*)
+{
+    if (!s_started.load(std::memory_order_relaxed) || !sta_can_connect()) return;
+    if (s_sta_connected.load(std::memory_order_relaxed)) return;
+    static uint32_t tick = 0;  // esp_timer 回调串行执行，无并发
+    ++tick;
+    // 配网热点开启时降频到 60s：连接尝试会把 STA 拉去跑信道，影响 AP 客户端与扫描
+    if (ap_state_snapshot().mode && (tick % 4) != 0) return;
+    esp_err_t err = esp_wifi_connect();
+    if (err != ESP_OK && err != ESP_ERR_WIFI_CONN) {
+        ESP_LOGW(TAG, "看门狗重连发起失败: %s", esp_err_to_name(err));
+    }
+}
+
+static void dns_captive_task(void*)
+{
+    int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
+    if (sock < 0) {
+        idf_log_line("配网 DNS 创建失败");
+        vTaskDelete(nullptr);
+        return;
+    }
+
+    timeval timeout = {};
+    timeout.tv_sec = 1;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+
+    sockaddr_in addr = {};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(53);
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    if (bind(sock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
+        idf_log_line("配网 DNS 绑定 53 端口失败");
+        close(sock);
+        vTaskDelete(nullptr);
+        return;
+    }
+
+    uint8_t req[512];
+    int ap_off_seconds = 0;
+    while (true) {
+        sockaddr_in from = {};
+        socklen_t from_len = sizeof(from);
+        int len = recvfrom(sock, req, sizeof(req), 0, reinterpret_cast<sockaddr*>(&from), &from_len);
+        if (!ap_state_snapshot().mode) {
+            // 配网结束后释放 53 端口和任务(recv 超时 1s，约 10s 后自退出；再次配网会重建)
+            if (++ap_off_seconds >= 10) break;
+            continue;
+        }
+        ap_off_seconds = 0;
+        if (len < 12) continue;
+
+        uint16_t qd = (static_cast<uint16_t>(req[4]) << 8) | req[5];
+        if (qd == 0) continue;
+        int pos = 12;
+        while (pos < len && req[pos] != 0) {
+            pos += req[pos] + 1;
+        }
+        if (pos + 5 > len) continue;
+        int question_end = pos + 5;
+        uint8_t resp[560];
+        if (question_end + 16 > static_cast<int>(sizeof(resp))) continue;
+        memcpy(resp, req, question_end);
+        resp[2] = 0x81; resp[3] = 0x80;  // standard response, no error
+        resp[6] = 0x00; resp[7] = 0x01;  // one A answer
+        resp[8] = resp[9] = resp[10] = resp[11] = 0;
+        int out = question_end;
+        resp[out++] = 0xC0; resp[out++] = 0x0C;  // name pointer
+        resp[out++] = 0x00; resp[out++] = 0x01;  // A
+        resp[out++] = 0x00; resp[out++] = 0x01;  // IN
+        resp[out++] = 0x00; resp[out++] = 0x00; resp[out++] = 0x00; resp[out++] = 0x3C;  // TTL
+        resp[out++] = 0x00; resp[out++] = 0x04;
+        resp[out++] = 192; resp[out++] = 168; resp[out++] = 1; resp[out++] = 1;
+        sendto(sock, resp, out, 0, reinterpret_cast<sockaddr*>(&from), from_len);
+    }
+
+    close(sock);
+    s_dns_task_started.store(false, std::memory_order_relaxed);
+    idf_log_line("配网已结束，DNS 门户任务已退出");
+    vTaskDelete(nullptr);
+}
+
+static bool mdns_query_matches_sms_local(const uint8_t* packet, int len, int offset)
+{
+    static constexpr char kName[] = "\x03sms\x05local";
+    int pos = offset;
+    for (size_t i = 0; i < sizeof(kName) - 1; ++i) {
+        if (pos >= len) return false;
+        char a = static_cast<char>(packet[pos++]);
+        char b = kName[i];
+        if (a >= 'A' && a <= 'Z') a = static_cast<char>(a - 'A' + 'a');
+        if (a != b) return false;
+    }
+    return pos < len && packet[pos] == 0;
+}
+
+static bool mdns_current_ip(uint8_t out[4])
+{
+    esp_netif_ip_info_t ip = {};
+    if (s_sta_netif && esp_netif_get_ip_info(s_sta_netif, &ip) == ESP_OK && ip.ip.addr != 0) {
+        memcpy(out, &ip.ip.addr, 4);
+        return true;
+    }
+    if (ap_state_snapshot().mode) {
+        out[0] = 192; out[1] = 168; out[2] = 1; out[3] = 1;
+        return true;
+    }
+    return false;
+}
+
+static void mdns_sms_task(void*)
+{
+    int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
+    if (sock < 0) {
+        idf_log_line("mDNS socket 创建失败");
+        vTaskDelete(nullptr);
+        return;
+    }
+
+    int yes = 1;
+    setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+    timeval timeout = {};
+    timeout.tv_sec = 1;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+
+    sockaddr_in addr = {};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(5353);
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    if (bind(sock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
+        idf_log_line("mDNS 绑定 5353 端口失败");
+        close(sock);
+        vTaskDelete(nullptr);
+        return;
+    }
+
+    uint8_t ttl = 255;  // RFC 6762 要求组播 TTL=255
+    setsockopt(sock, IPPROTO_IP, IP_MULTICAST_TTL, &ttl, sizeof(ttl));
+
+    auto join_group = [sock]() {
+        ip_mreq mreq = {};
+        mreq.imr_multiaddr.s_addr = inet_addr("224.0.0.251");
+        mreq.imr_interface.s_addr = htonl(INADDR_ANY);
+        return setsockopt(sock, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mreq, sizeof(mreq)) == 0;
+    };
+    // 任务启动早于任何网卡拿到 IP，首次加组可能失败——失败则周期重试，
+    // 否则收不到 224.0.0.251 的查询，sms.local 整个运行期都静默失效
+    bool joined = join_group();
+    if (joined) idf_log_line("mDNS 已启动: http://sms.local");
+    else idf_log_line("mDNS 加入组播组失败，稍后自动重试");
+
+    uint8_t req[512];
+    int retry_countdown = 0;
+    while (true) {
+        sockaddr_in from = {};
+        socklen_t from_len = sizeof(from);
+        int len = recvfrom(sock, req, sizeof(req), 0, reinterpret_cast<sockaddr*>(&from), &from_len);
+        if (!joined && ++retry_countdown >= 15) {  // recv 超时 1s，约每 15s 重试加组
+            retry_countdown = 0;
+            joined = join_group();
+            if (joined) idf_log_line("mDNS 已启动: http://sms.local");
+        }
+        if (len < 12) continue;
+        uint16_t qd = (static_cast<uint16_t>(req[4]) << 8) | req[5];
+        int pos = 12;
+        bool match = false;
+        for (uint16_t q = 0; q < qd && pos + 5 < len; ++q) {
+            if (mdns_query_matches_sms_local(req, len, pos)) match = true;
+            while (pos < len && req[pos] != 0) pos += req[pos] + 1;
+            pos += 5;
+        }
+        uint8_t ip[4] = {};
+        if (!match || !mdns_current_ip(ip)) continue;
+
+        uint8_t resp[96];
+        int out = 0;
+        resp[out++] = 0; resp[out++] = 0;      // mDNS transaction id
+        resp[out++] = 0x84; resp[out++] = 0x00; // response + authoritative
+        resp[out++] = 0; resp[out++] = 0;      // questions
+        resp[out++] = 0; resp[out++] = 1;      // answers
+        resp[out++] = 0; resp[out++] = 0;      // authority
+        resp[out++] = 0; resp[out++] = 0;      // additional
+        resp[out++] = 3; memcpy(resp + out, "sms", 3); out += 3;
+        resp[out++] = 5; memcpy(resp + out, "local", 5); out += 5;
+        resp[out++] = 0;
+        resp[out++] = 0; resp[out++] = 1;      // A
+        resp[out++] = 0x80; resp[out++] = 1;   // cache-flush + IN
+        resp[out++] = 0; resp[out++] = 0; resp[out++] = 0; resp[out++] = 120;
+        resp[out++] = 0; resp[out++] = 4;
+        memcpy(resp + out, ip, 4); out += 4;
+
+        sockaddr_in dst = {};
+        dst.sin_family = AF_INET;
+        dst.sin_port = htons(5353);
+        dst.sin_addr.s_addr = inet_addr("224.0.0.251");
+        sendto(sock, resp, out, 0, reinterpret_cast<sockaddr*>(&dst), sizeof(dst));
+    }
+}
+
+static esp_err_t configure_ap_netif(void)
+{
+    esp_netif_ip_info_t ip_info = {};
+    esp_netif_set_ip4_addr(&ip_info.ip, 192, 168, 1, 1);
+    esp_netif_set_ip4_addr(&ip_info.gw, 192, 168, 1, 1);
+    esp_netif_set_ip4_addr(&ip_info.netmask, 255, 255, 255, 0);
+
+    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_netif_dhcps_stop(s_ap_netif));
+    esp_err_t err = esp_netif_set_ip_info(s_ap_netif, &ip_info);
+    if (err != ESP_OK) return err;
+
+    const char* captive_uri = "http://192.168.1.1/";
+    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_netif_dhcps_option(
+        s_ap_netif, ESP_NETIF_OP_SET, ESP_NETIF_CAPTIVEPORTAL_URI,
+        const_cast<char*>(captive_uri), strlen(captive_uri)));
+    err = esp_netif_dhcps_start(s_ap_netif);
+    return err == ESP_ERR_ESP_NETIF_DHCP_ALREADY_STARTED ? ESP_OK : err;
+}
+
+static esp_err_t start_provisioning_ap(bool manual)
+{
+    ApState ap = ap_state_snapshot();
+    if (ap.mode) {
+        if (manual && !ap.manual) {
+            set_ap_state(true, true, ap.ssid);
+            idf_log_line("BOOT长按触发：保留当前配网热点，已切为手动配网模式");
+        }
+        idf_logf("配网热点已开启，请访问 http://192.168.1.1/");
+        return ESP_OK;
+    }
+
+    uint8_t mac[6] = {};
+    esp_err_t err = esp_read_mac(mac, ESP_MAC_WIFI_SOFTAP);
+    if (err != ESP_OK) {
+        idf_logf("配网热点启动失败: 读取 MAC 失败 %s", esp_err_to_name(err));
+        return err;
+    }
+    char ssid[33];
+    snprintf(ssid, sizeof(ssid), "%s%02X%02X", AP_SSID_PREFIX, mac[4], mac[5]);
+    err = configure_ap_netif();
+    if (err != ESP_OK) {
+        idf_logf("配网热点启动失败: 配置 AP IP 失败 %s", esp_err_to_name(err));
+        return err;
+    }
+
+    wifi_config_t ap_config = {};
+    strlcpy(reinterpret_cast<char*>(ap_config.ap.ssid), ssid, sizeof(ap_config.ap.ssid));
+    ap_config.ap.ssid_len = strlen(ssid);
+    ap_config.ap.channel = 1;
+    ap_config.ap.max_connection = 4;
+    ap_config.ap.authmode = WIFI_AUTH_OPEN;
+    ap_config.ap.pmf_cfg.required = false;
+
+    err = esp_wifi_set_mode(WIFI_MODE_APSTA);
+    if (err != ESP_OK) {
+        idf_logf("配网热点启动失败: 设置 APSTA 模式失败 %s", esp_err_to_name(err));
+        return err;
+    }
+    err = esp_wifi_set_config(WIFI_IF_AP, &ap_config);
+    if (err != ESP_OK) {
+        idf_logf("配网热点启动失败: 设置 AP 参数失败 %s", esp_err_to_name(err));
+        return err;
+    }
+    if (sta_can_connect()) ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_connect());
+    set_ap_state(true, manual, ssid);
+    if (!s_dns_task_started.load(std::memory_order_relaxed)) {
+        BaseType_t ok = xTaskCreate(dns_captive_task, "idf_dns", 3072, nullptr, 2, nullptr);
+        if (ok == pdPASS) s_dns_task_started.store(true, std::memory_order_relaxed);
+        else idf_log_line("配网 DNS 任务启动失败");
+    }
+    ESP_LOGW(TAG, "%s: %s, http://192.168.1.1/",
+             manual ? "BOOT长按触发，已开启配网热点" : "已开启配网热点", ssid);
+    idf_logf("%s: %s, http://192.168.1.1/",
+             manual ? "BOOT长按触发，已开启配网热点" : "已开启配网热点", ssid);
+    return ESP_OK;
+}
+
+static void provision_button_task(void*)
+{
+    gpio_config_t io = {};
+    io.pin_bit_mask = 1ULL << PROVISION_BUTTON_PIN;
+    io.mode = GPIO_MODE_INPUT;
+    io.pull_up_en = GPIO_PULLUP_ENABLE;
+    io.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    io.intr_type = GPIO_INTR_DISABLE;
+    gpio_config(&io);
+
+    int64_t down_since = 0;
+    bool triggered = false;
+    while (true) {
+        bool pressed = gpio_get_level(PROVISION_BUTTON_PIN) == 0;
+        int64_t now_ms = esp_timer_get_time() / 1000LL;
+        if (!pressed) {
+            down_since = 0;
+            triggered = false;
+        } else {
+            if (down_since == 0) down_since = now_ms;
+            if (!triggered && now_ms - down_since >= PROVISION_BUTTON_HOLD_MS) {
+                triggered = true;
+                start_provisioning_ap(true);
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+}
+
+static esp_err_t connect_sta(const IdfConfig& config)
+{
+    wifi_config_t sta_config = {};
+    strlcpy(reinterpret_cast<char*>(sta_config.sta.ssid), config.wifiSsid.c_str(), sizeof(sta_config.sta.ssid));
+    strlcpy(reinterpret_cast<char*>(sta_config.sta.password), config.wifiPass.c_str(), sizeof(sta_config.sta.password));
+    sta_config.sta.scan_method = WIFI_FAST_SCAN;
+    sta_config.sta.sort_method = WIFI_CONNECT_AP_BY_SIGNAL;
+    sta_config.sta.threshold.authmode = WIFI_AUTH_OPEN;
+
+    esp_err_t err = esp_wifi_set_mode(WIFI_MODE_STA);
+    if (err != ESP_OK) return err;
+    err = esp_wifi_set_config(WIFI_IF_STA, &sta_config);
+    if (err != ESP_OK) return err;
+    s_sta_configured.store(true, std::memory_order_relaxed);
+    err = esp_wifi_connect();
+    if (err != ESP_OK) return err;
+    ESP_LOGI(TAG, "连接 WiFi: %s%s", config.wifiSsid.c_str(), config.wifiFromFallback ? " (fallback)" : "");
+    idf_logf("连接 WiFi: %s%s", config.wifiSsid.c_str(), config.wifiFromFallback ? " (fallback)" : "");
+
+    EventBits_t bits = xEventGroupWaitBits(
+        s_wifi_event_group, WIFI_CONNECTED_BIT, pdFALSE, pdFALSE,
+        pdMS_TO_TICKS(WIFI_CONNECT_TIMEOUT_MS));
+    return (bits & WIFI_CONNECTED_BIT) ? ESP_OK : ESP_ERR_TIMEOUT;
+}
+
+esp_err_t idf_wifi_start(const IdfConfig& config)
+{
+    if (s_started.load(std::memory_order_relaxed)) return ESP_OK;
+
+    s_state_mutex = xSemaphoreCreateMutex();
+    if (!s_state_mutex) return ESP_ERR_NO_MEM;
+
+    s_wifi_event_group = xEventGroupCreate();
+    if (!s_wifi_event_group) return ESP_ERR_NO_MEM;
+    s_has_sta_credentials.store(!config.wifiSsid.empty(), std::memory_order_relaxed);
+
+    s_sta_netif = esp_netif_create_default_wifi_sta();
+    s_ap_netif = esp_netif_create_default_wifi_ap();
+    if (!s_sta_netif || !s_ap_netif) return ESP_ERR_NO_MEM;
+
+    wifi_init_config_t init_cfg = WIFI_INIT_CONFIG_DEFAULT();
+    esp_err_t err = esp_wifi_init(&init_cfg);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_wifi_init failed: %s", esp_err_to_name(err));
+        idf_logf("WiFi 初始化失败: %s", esp_err_to_name(err));
+        return err;
+    }
+    err = esp_wifi_set_storage(WIFI_STORAGE_RAM);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_wifi_set_storage failed: %s", esp_err_to_name(err));
+        idf_logf("WiFi 存储模式配置失败: %s", esp_err_to_name(err));
+        return err;
+    }
+    err = esp_wifi_set_ps(WIFI_PS_NONE);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_wifi_set_ps failed: %s", esp_err_to_name(err));
+        idf_logf("WiFi 省电模式配置失败: %s", esp_err_to_name(err));
+        return err;
+    }
+    err = esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, nullptr);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "WIFI_EVENT handler register failed: %s", esp_err_to_name(err));
+        idf_logf("WiFi 事件处理器注册失败: %s", esp_err_to_name(err));
+        return err;
+    }
+    err = esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, nullptr);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "IP_EVENT handler register failed: %s", esp_err_to_name(err));
+        idf_logf("IP 事件处理器注册失败: %s", esp_err_to_name(err));
+        return err;
+    }
+    err = esp_wifi_start();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_wifi_start failed: %s", esp_err_to_name(err));
+        idf_logf("WiFi 启动失败: %s", esp_err_to_name(err));
+        return err;
+    }
+    s_started.store(true, std::memory_order_relaxed);
+    if (!s_mdns_task_started.load(std::memory_order_relaxed)) {
+        BaseType_t ok = xTaskCreate(mdns_sms_task, "idf_mdns", 3072, nullptr, 2, nullptr);
+        if (ok == pdPASS) s_mdns_task_started.store(true, std::memory_order_relaxed);
+        else idf_log_line("mDNS responder 启动失败");
+    }
+    if (!s_button_task_started.load(std::memory_order_relaxed)) {
+        // 3072：任务里 start_provisioning_ap 会用到 wifi_config_t(~132B) + 日志格式化缓冲
+        BaseType_t ok = xTaskCreate(provision_button_task, "idf_boot_ap", 3072, nullptr, 2, nullptr);
+        if (ok == pdPASS) s_button_task_started.store(true, std::memory_order_relaxed);
+        else idf_log_line("BOOT 配网按键任务启动失败");
+    }
+
+    if (!s_reconnect_timer) {
+        const esp_timer_create_args_t targs = {
+            .callback = &reconnect_watchdog_cb,
+            .arg = nullptr,
+            .dispatch_method = ESP_TIMER_TASK,
+            .name = "wifi_watchdog",
+            .skip_unhandled_events = true,
+        };
+        if (esp_timer_create(&targs, &s_reconnect_timer) == ESP_OK) {
+            esp_timer_start_periodic(s_reconnect_timer, 15ULL * 1000 * 1000);
+        } else {
+            idf_log_line("WiFi 重连看门狗创建失败");
+        }
+    }
+
+    if (config.wifiSsid.empty()) {
+        ESP_LOGW(TAG, "未配置 WiFi，进入配网 AP");
+        idf_log_line("未配置 WiFi，进入配网 AP");
+        return start_provisioning_ap(false);
+    }
+
+    err = connect_sta(config);
+    if (err == ESP_OK) {
+        set_ap_state(false, false, std::string());
+        return ESP_OK;
+    }
+
+    ESP_LOGW(TAG, "WiFi 首次连接超时，进入 APSTA 配网模式");
+    idf_log_line("WiFi 首次连接超时，进入 APSTA 配网模式");
+    ESP_ERROR_CHECK_WITHOUT_ABORT(start_provisioning_ap(false));
+    return ESP_OK;
+}
+
+esp_err_t idf_wifi_reconnect(void)
+{
+    if (!s_started.load(std::memory_order_relaxed)) return ESP_ERR_INVALID_STATE;
+    if (!sta_can_connect()) return ESP_ERR_INVALID_STATE;
+    xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT);
+    return esp_wifi_connect();
+}
+
+static void json_escape_append(std::string& out, const std::string& value)
+{
+    for (char ch : value) {
+        switch (ch) {
+            case '\\': out += "\\\\"; break;
+            case '"': out += "\\\""; break;
+            case '\n': out += "\\n"; break;
+            case '\r': out += "\\r"; break;
+            case '\t': out += "\\t"; break;
+            default:
+                if (static_cast<unsigned char>(ch) < 0x20) {
+                    char buf[7];
+                    snprintf(buf, sizeof(buf), "\\u%04x", static_cast<unsigned char>(ch));
+                    out += buf;
+                } else {
+                    out += ch;
+                }
+        }
+    }
+}
+
+esp_err_t idf_wifi_scan_json(std::string& out_json)
+{
+    if (!s_started.load(std::memory_order_relaxed)) return ESP_ERR_INVALID_STATE;
+    wifi_mode_t mode = WIFI_MODE_NULL;
+    esp_err_t err = esp_wifi_get_mode(&mode);
+    if (err != ESP_OK) return err;
+    if (mode == WIFI_MODE_AP) {
+        err = esp_wifi_set_mode(WIFI_MODE_APSTA);
+        if (err != ESP_OK) return err;
+    }
+
+    wifi_scan_config_t scan_cfg = {};
+    err = esp_wifi_scan_start(&scan_cfg, true);
+    if (err != ESP_OK) return err;
+
+    uint16_t total = 0;
+    err = esp_wifi_scan_get_ap_num(&total);
+    if (err != ESP_OK) return err;
+    uint16_t count = std::min<uint16_t>(total, WIFI_SCAN_RECORD_LIMIT);
+    std::vector<wifi_ap_record_t> records(count);
+    if (count) {
+        err = esp_wifi_scan_get_ap_records(&count, records.data());
+        if (err != ESP_OK) return err;
+    }
+
+    out_json.clear();
+    out_json.reserve(1024);
+    out_json += "[";
+    bool first = true;
+    for (uint16_t i = 0; i < count; ++i) {
+        const char* ssid = reinterpret_cast<const char*>(records[i].ssid);
+        if (!ssid[0]) continue;
+        bool duplicate = false;
+        for (uint16_t k = 0; k < count; ++k) {
+            if (k == i) continue;
+            const char* other = reinterpret_cast<const char*>(records[k].ssid);
+            if (strcmp(ssid, other) != 0) continue;
+            if (records[k].rssi > records[i].rssi ||
+                (records[k].rssi == records[i].rssi && k < i)) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (duplicate) continue;
+        if (!first) out_json += ",";
+        first = false;
+        out_json += "{\"ssid\":\"";
+        json_escape_append(out_json, ssid);
+        char tail[96];
+        snprintf(tail, sizeof(tail), "\",\"rssi\":%d,\"enc\":%d}",
+                 records[i].rssi,
+                 records[i].authmode == WIFI_AUTH_OPEN ? 0 : 1);
+        out_json += tail;
+    }
+    out_json += "]";
+    return ESP_OK;
+}
+
+IdfWifiStatus idf_wifi_get_status(void)
+{
+    IdfWifiStatus s;
+    ApState ap_state = ap_state_snapshot();
+    s.apMode = ap_state.mode;
+    s.apSsid = ap_state.ssid;
+    if (ap_state.mode) s.apIp = "192.168.1.1";
+
+    uint8_t mac[6] = {};
+    if (esp_read_mac(mac, ESP_MAC_WIFI_STA) == ESP_OK) s.mac = mac_to_string(mac);
+
+    wifi_ap_record_t ap = {};
+    if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) {
+        s.staConnected = true;
+        s.ssid = reinterpret_cast<const char*>(ap.ssid);
+        s.rssi = ap.rssi;
+        s.channel = ap.primary;
+        s.bssid = mac_to_string(ap.bssid);
+    }
+
+    esp_netif_ip_info_t ip = {};
+    if (s_sta_netif && esp_netif_get_ip_info(s_sta_netif, &ip) == ESP_OK && ip.ip.addr != 0) {
+        s.ip = ip4_to_string(ip.ip);
+        s.gw = ip4_to_string(ip.gw);
+        s.mask = ip4_to_string(ip.netmask);
+    }
+
+    esp_netif_dns_info_t dns = {};
+    if (s_sta_netif && esp_netif_get_dns_info(s_sta_netif, ESP_NETIF_DNS_MAIN, &dns) == ESP_OK &&
+        dns.ip.u_addr.ip4.addr != 0) {
+        s.dns = ip4_to_string(dns.ip.u_addr.ip4);
+    }
+
+    return s;
+}

@@ -1,15 +1,15 @@
 code/wifi_config.h
 
-# Arduino / ESP32 编译产物：统一只允许输出到 build/，且不纳入版本库
+# ESP-IDF 编译产物：统一只允许输出到 build/，且不纳入版本库
 /build/**
 !/build/
 !/build/AGENTS.md
 /build-codex/
 /build-codex2/
-
-# 主机测试构建产物
-test/run_tests
-test/run_tests.exe
+/sdkconfig
+/sdkconfig.old
+/dependencies.lock
+/managed_components/
 
 # 网页预览产物(由 preview/build_preview.py 生成)
 preview/index.html

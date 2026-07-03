@@ -34,16 +34,38 @@
       var html = '';
       for (var i = 0; i < 5; i++) {
         var ch = chans[i] || {}, idx = String(i), en = !!ch.enabled;
-        html += '<div class="push-channel' + (en ? ' enabled' : '') + '" id="channel' + idx + '">';
+        var defName = '通道' + (i + 1);
+        var configured = en || !!ch.url || !!ch.key1 || !!ch.key2 || !!ch.customBody || (ch.type && ch.type != 1) || (ch.name && ch.name !== defName);
+        var folded = !en;
+        html += '<div class="push-channel' + (en ? ' enabled' : '') + (folded ? ' folded' : '') + (configured ? ' configured' : '') + '" id="channel' + idx + '" data-configured="' + (configured ? '1' : '0') + '">';
         html += '<div class="push-channel-header">';
         html += '<input type="checkbox" name="push' + idx + 'en" id="push' + idx + 'en" onchange="toggleChannel(' + idx + ')"' + (en ? ' checked' : '') + '>';
         html += '<label for="push' + idx + 'en" class="label-inline">启用推送通道 ' + (i + 1) + '</label>';
+        html += '<button type="button" class="channel-fold" onclick="toggleChannelBody(' + idx + ')" id="foldBtn' + idx + '">展开</button>';
         html += '</div><div class="push-channel-body">';
-        html += '<div class="form-group"><label>通道名称</label><input type="text" name="push' + idx + 'name" value="' + htmlEsc(ch.name || ('通道' + (i + 1))) + '" placeholder="自定义名称"></div>';
+        html += '<div class="form-group"><label>通道名称</label><input type="text" name="push' + idx + 'name" value="' + htmlEsc(ch.name || defName) + '" placeholder="自定义名称"></div>';
         html += '<div class="form-group"><label>推送方式</label><select name="push' + idx + 'type" id="push' + idx + 'type" onchange="updateTypeHint(' + idx + ')">' + pushTypeOptions(ch.type || 1) + '</select><div class="push-type-hint" id="hint' + idx + '"></div></div>';
-        html += '<div class="form-group"><label>推送URL/Webhook</label><input type="text" name="push' + idx + 'url" value="' + htmlEsc(ch.url || '') + '" placeholder="http://your-server.com/api 或 webhook地址"></div>';
+        html += '<div class="form-group"><label id="urllabel' + idx + '">推送URL/Webhook</label><input type="text" name="push' + idx + 'url" id="url' + idx + '" value="' + htmlEsc(ch.url || '') + '" placeholder="http://your-server.com/api 或 webhook地址"></div>';
         html += '<div id="extra' + idx + '" style="display:none;"><div class="form-group"><label id="key1label' + idx + '">参数1</label><input type="text" name="push' + idx + 'key1" id="key1' + idx + '" value="' + htmlEsc(ch.key1 || '') + '"></div>';
-        html += '<div class="form-group" id="key2group' + idx + '"><label id="key2label' + idx + '">参数2</label><input type="text" name="push' + idx + 'key2" id="key2' + idx + '" value="' + htmlEsc(ch.key2 || '') + '"></div></div>';
+        html += '<div class="form-group" id="key2group' + idx + '"><label id="key2label' + idx + '">参数2</label><input type="text" name="push' + idx + 'key2" id="key2' + idx + '" value="' + htmlEsc(ch.key2 || '') + '"></div>';
+        html += '<details class="bark-advanced" id="barkAdvanced' + idx + '" style="display:none;"><summary>Bark 高级参数 <span class="bark-summary" id="barkSummary' + idx + '"></span></summary><div class="bark-params" id="barkParams' + idx + '"><div class="bark-param-grid">';
+        html += '<div class="form-group"><label>副标题 subtitle</label><input type="text" id="bark_subtitle' + idx + '" data-bark-key="subtitle" placeholder="可选"></div>';
+        html += '<div class="form-group"><label>分组 group</label><input type="text" id="bark_group' + idx + '" data-bark-key="group" placeholder="SMS"></div>';
+        html += '<div class="form-group"><label>中断级别 level</label><select id="bark_level' + idx + '" data-bark-key="level"><option value="">默认 active</option><option value="active">active</option><option value="timeSensitive">timeSensitive</option><option value="passive">passive</option><option value="critical">critical</option></select></div>';
+        html += '<div class="form-group"><label>铃声 sound</label><input type="text" id="bark_sound' + idx + '" data-bark-key="sound" placeholder="bell / minuet"></div>';
+        html += '<div class="form-group"><label>角标 badge</label><input type="number" id="bark_badge' + idx + '" data-bark-key="badge" placeholder="1"></div>';
+        html += '<div class="form-group"><label>保存秒数 ttl</label><input type="number" id="bark_ttl' + idx + '" data-bark-key="ttl" placeholder="3600"></div>';
+        html += '<div class="form-group"><label>图标 icon</label><input type="url" id="bark_icon' + idx + '" data-bark-key="icon" placeholder="https://.../icon.png"></div>';
+        html += '<div class="form-group"><label>图片 image</label><input type="url" id="bark_image' + idx + '" data-bark-key="image" placeholder="https://.../image.jpg"></div>';
+        html += '<div class="form-group"><label>点击 URL</label><input type="text" id="bark_url' + idx + '" data-bark-key="url" placeholder="https://... 或 URL Scheme"></div>';
+        html += '<div class="form-group"><label>复制内容 copy</label><input type="text" id="bark_copy' + idx + '" data-bark-key="copy" placeholder="{message}"></div>';
+        html += '<div class="form-group"><label>自动复制 autoCopy</label><select id="bark_autoCopy' + idx + '" data-bark-key="autoCopy"><option value="">跟随 App</option><option value="1">开启</option><option value="0">关闭</option></select></div>';
+        html += '<div class="form-group"><label>保存历史 isArchive</label><select id="bark_isArchive' + idx + '" data-bark-key="isArchive"><option value="">跟随 App</option><option value="1">保存</option><option value="0">不保存</option></select></div>';
+        html += '<div class="form-group"><label>持续响铃 call</label><select id="bark_call' + idx + '" data-bark-key="call"><option value="">关闭</option><option value="1">开启</option></select></div>';
+        html += '<div class="form-group"><label>点击动作 action</label><select id="bark_action' + idx + '" data-bark-key="action"><option value="">默认</option><option value="alert">alert 弹窗</option></select></div>';
+        html += '<div class="form-group"><label>通知 ID id</label><input type="text" id="bark_id' + idx + '" data-bark-key="id" placeholder="同 ID 会更新通知"></div>';
+        html += '<div class="form-group"><label>其它参数</label><input type="text" id="bark_other' + idx + '" placeholder="markdown=...&ciphertext=..."></div>';
+        html += '</div><p class="form-hint">保存时会自动合成为 Bark 参数；可用 {sender} {message} {timestamp} 占位符。</p></div></details></div>';
         html += '<div id="custom' + idx + '" style="display:none;"><div class="form-group"><label>请求体模板（使用 {sender} {message} {timestamp} 占位符）</label><textarea name="push' + idx + 'body" rows="4" style="width:100%;font-family:monospace;">' + htmlEsc(ch.customBody || '') + '</textarea></div></div>';
         html += '<button type="button" class="btn btn-secondary btn-sm" onclick="testPush(' + idx + ')">测试推送</button><div class="result-box" id="pushTestResult' + idx + '"></div>';
         html += '</div></div>';
@@ -68,7 +90,7 @@
       return html.replace(/%([A-Z0-9_]{2,})%/g, function(m, k){ return Object.prototype.hasOwnProperty.call(map, k) ? map[k] : m; });
     }
     function panelHook(name) {
-      if (name === 'log') { refreshLog(); startLogPoll(); } else { stopLogPoll(); }
+      if (name === 'log') { initLogPanel(); } else { stopLogPoll(); }
       if (name === 'overview') { loadStatus(); loadLatestOtp(); startStatusPoll(); } else { stopStatusPoll(); }
       if (name === 'inbox') loadMessages();
       if (name === 'keepalive' || name === 'diagnose') kaLoadStatus();
@@ -81,7 +103,15 @@
       var a = document.querySelector('.sidebar-nav a[data-panel="' + name + '"]');
       if (a) a.classList.add('active');
     }
+    function normalizePanelName(name) {
+      name = String(name || '').replace(/^#/, '');
+      return document.querySelector('.sidebar-nav a[data-panel="' + name + '"]') ? name : 'overview';
+    }
+    function panelFromHash() {
+      return normalizePanelName(decodeURIComponent((location.hash || '').slice(1)));
+    }
     function switchPanel(name) {
+      name = normalizePanelName(name);
       var host = document.getElementById('panelHost');
       activateNav(name);
       if (loadedPanels[name]) {
@@ -107,15 +137,112 @@
       });
     }
     document.querySelectorAll('.sidebar-nav a').forEach(function(a) {
-      a.addEventListener('click', function() { switchPanel(this.dataset.panel); });
+      a.addEventListener('click', function() {
+        var name = normalizePanelName(this.dataset.panel);
+        if (location.hash === '#' + name) switchPanel(name);
+        else location.hash = name;
+      });
     });
+    window.addEventListener('hashchange', function() { switchPanel(panelFromHash()); });
 
     // ---- Push Channel JS ----
     function toggleChannel(idx) {
       var ch = document.getElementById('channel' + idx);
       var cb = document.getElementById('push' + idx + 'en');
       if (!ch || !cb) return;
-      if (cb.checked) ch.classList.add('enabled'); else ch.classList.remove('enabled');
+      if (cb.checked) {
+        ch.classList.add('enabled');
+        ch.classList.remove('folded');
+        ch.dataset.configured = '1';
+      } else {
+        ch.classList.remove('enabled');
+        ch.classList.add('folded');
+      }
+      updateChannelFoldText(idx);
+    }
+    function updateChannelFoldText(idx) {
+      var ch = document.getElementById('channel' + idx);
+      var btn = document.getElementById('foldBtn' + idx);
+      if (!ch || !btn) return;
+      btn.textContent = ch.classList.contains('folded') ? '展开' : '收起';
+    }
+    function toggleChannelBody(idx) {
+      var ch = document.getElementById('channel' + idx);
+      if (!ch) return;
+      ch.classList.toggle('folded');
+      updateChannelFoldText(idx);
+    }
+    var barkKeys = ['subtitle','group','level','sound','badge','ttl','icon','image','url','copy','autoCopy','isArchive','call','action','id'];
+    function barkDecode(v) {
+      try { return decodeURIComponent(String(v || '').replace(/\+/g, ' ')); } catch (e) { return String(v || ''); }
+    }
+    function barkEncode(v) { return encodeURIComponent(String(v || '')); }
+    function parseParamString(raw) {
+      var out = {}, extra = [];
+      String(raw || '').replace(/^\?+/, '').split(/[&\n]/).forEach(function(part) {
+        part = part.trim();
+        if (!part) return;
+        var p = part.indexOf('='), k = barkDecode(p < 0 ? part : part.slice(0, p)).trim();
+        if (!k) return;
+        var v = p < 0 ? '1' : barkDecode(part.slice(p + 1));
+        if (barkKeys.indexOf(k) >= 0) out[k] = v;
+        else if (['title','body','device_key','device_keys'].indexOf(k) < 0) extra.push(barkEncode(k) + '=' + barkEncode(v));
+      });
+      out._other = extra.join('&');
+      return out;
+    }
+    function loadBarkParams(idx) {
+      var key2 = document.getElementById('key2' + idx);
+      var box = document.getElementById('barkParams' + idx);
+      if (!key2 || !box) return;
+      var params = parseParamString(key2.value);
+      barkKeys.forEach(function(k) {
+        var el = box.querySelector('[data-bark-key="' + k + '"]');
+        if (el) el.value = params[k] || '';
+      });
+      var other = document.getElementById('bark_other' + idx);
+      if (other) other.value = params._other || '';
+      updateBarkSummary(idx);
+    }
+    function updateBarkSummary(idx) {
+      var key2 = document.getElementById('key2' + idx);
+      var summary = document.getElementById('barkSummary' + idx);
+      if (!key2 || !summary) return;
+      var params = parseParamString(key2.value);
+      var items = [];
+      ['group','level','sound','copy'].forEach(function(k) { if (params[k]) items.push(k + '=' + params[k]); });
+      if (params._other) items.push('其它');
+      summary.textContent = items.length ? items.slice(0, 4).join(' · ') : '未配置';
+    }
+    function serializeBarkParams(idx) {
+      var key2 = document.getElementById('key2' + idx);
+      var box = document.getElementById('barkParams' + idx);
+      if (!key2 || !box) return;
+      var parts = [];
+      barkKeys.forEach(function(k) {
+        var el = box.querySelector('[data-bark-key="' + k + '"]');
+        var v = el ? String(el.value || '').trim() : '';
+        if (v) parts.push(barkEncode(k) + '=' + barkEncode(v));
+      });
+      var other = document.getElementById('bark_other' + idx);
+      if (other && other.value.trim()) parts.push(other.value.trim().replace(/^[?&]+/, ''));
+      key2.value = parts.join('&');
+      updateBarkSummary(idx);
+    }
+    function bindBarkParams(idx) {
+      var box = document.getElementById('barkParams' + idx);
+      if (!box || box.dataset.bound) return;
+      box.dataset.bound = '1';
+      box.querySelectorAll('input,select').forEach(function(el) {
+        el.addEventListener('input', function(){ serializeBarkParams(idx); });
+        el.addEventListener('change', function(){ serializeBarkParams(idx); });
+      });
+    }
+    function serializeAllBarkParams() {
+      for (var i = 0; i < 5; i++) {
+        var sel = document.getElementById('push' + i + 'type');
+        if (sel && parseInt(sel.value) === 2) serializeBarkParams(i);
+      }
     }
     function updateTypeHint(idx) {
       var sel = document.getElementById('push' + idx + 'type');
@@ -124,15 +251,21 @@
       var custom = document.getElementById('custom' + idx);
       if (!sel || !hint || !extra || !custom) return;
       var type = parseInt(sel.value);
+      var bp = document.getElementById('barkParams' + idx);
+      var ba = document.getElementById('barkAdvanced' + idx);
       extra.style.display = 'none'; custom.style.display = 'none';
       document.getElementById('key1label' + idx).innerText = '参数 1';
       document.getElementById('key2label' + idx).innerText = '参数 2';
+      document.getElementById('urllabel' + idx).innerText = '推送URL/Webhook';
+      document.getElementById('url' + idx).placeholder = 'http://your-server.com/api 或 webhook地址';
       document.getElementById('key1' + idx).placeholder = '';
       document.getElementById('key2' + idx).placeholder = '';
       var kg = document.getElementById('key2group' + idx);
       if (kg) kg.style.display = 'none';
+      if (bp) bp.style.display = '';
+      if (ba) ba.style.display = 'none';
       if (type == 1) hint.innerHTML = 'POST JSON<br>{"sender":"+447700900123","message":"...","timestamp":"2026-01-01 12:00:00"}';
-      else if (type == 2) hint.innerHTML = 'Bark (iOS)<br>POST {"title":"发送者","body":"短信内容"}';
+      else if (type == 2) { hint.innerHTML = 'Bark (iOS)<br>URL 留空使用 https://api.day.app；自建填服务器根地址，设备端发送到 /push。'; extra.style.display='block'; if(kg)kg.style.display='none'; if(ba)ba.style.display='block'; document.getElementById('urllabel'+idx).innerText='Bark 服务器 URL'; document.getElementById('url'+idx).placeholder='留空=官方服务；自建=https://bark.example.com'; document.getElementById('key1label'+idx).innerText='Device Key'; document.getElementById('key1'+idx).placeholder='Bark App 中显示的 key'; bindBarkParams(idx); loadBarkParams(idx); serializeBarkParams(idx); }
       else if (type == 3) hint.innerHTML = 'GET 请求<br>URL?sender=xxx&message=xxx&timestamp=xxx';
       else if (type == 4) { hint.innerHTML = '钉钉机器人<br>填写 Webhook 地址，加签需填 Secret'; extra.style.display='block'; document.getElementById('key1label'+idx).innerText='Secret（加签密钥，可选）'; document.getElementById('key1'+idx).placeholder='SEC...'; }
       else if (type == 5) { hint.innerHTML = 'PushPlus<br>填写 Token，URL 留空使用默认'; extra.style.display='block'; document.getElementById('key1label'+idx).innerText='Token'; document.getElementById('key1'+idx).placeholder='pushplus token'; if(kg)kg.style.display='block'; document.getElementById('key2label'+idx).innerText='发送渠道'; document.getElementById('key2'+idx).placeholder='wechat / extension / app'; }
@@ -146,7 +279,13 @@
     function setupChannels() {
       for (var i = 0; i < 5; i++) {
         var ch = document.getElementById('channel' + i), en = document.getElementById('push' + i + 'en');
-        if (ch && en && !en.checked) ch.style.display = 'none';
+        if (ch && en && ch.dataset.configured !== '1' && !en.checked) ch.style.display = 'none';
+        updateChannelFoldText(i);
+      }
+      var form = document.getElementById('mainForm3');
+      if (form && !form.dataset.barkSubmitBound) {
+        form.dataset.barkSubmitBound = '1';
+        form.addEventListener('submit', serializeAllBarkParams);
       }
       updateAddBtn();
     }
@@ -161,8 +300,12 @@
         var ch = document.getElementById('channel' + i);
         if (ch && ch.style.display === 'none') {
           ch.style.display = '';
+          ch.dataset.configured = '1';
+          ch.classList.remove('folded');
           var en = document.getElementById('push' + i + 'en');
           if (en) { en.checked = true; toggleChannel(i); }
+          updateTypeHint(i);
+          updateChannelFoldText(i);
           updateAddBtn();
           return;
         }
@@ -360,8 +503,8 @@
       el.addEventListener('keydown',function(e){if(e.key==='Enter')sendAT();});
     }
 
-    // ---- Log Viewer (since 游标增量 + 后台标签页不轮询) ----
-    var logTimer = null, logSince = 0, logLines = [], logLoading = false, logViewGen = 0;
+    // ---- Log Viewer (进入页/手动刷新重放保留日志，自动刷新只追新增) ----
+    var logTimer = null, logSince = 0, logLines = [], logLoading = false;
     function startLogPoll() {
       if (logTimer) return;
       logTimer = setInterval(refreshLog, 2000);
@@ -370,32 +513,63 @@
       if (logTimer) { clearInterval(logTimer); logTimer = null; }
     }
     function toggleLogAuto() {
-      if (document.getElementById('logAuto').checked) startLogPoll();
+      var auto = document.getElementById('logAuto');
+      if (auto && auto.checked) startLogPoll();
       else stopLogPoll();
     }
-    function clearLogUI() { logLines = []; logViewGen++; document.getElementById('logView').textContent = ''; }
-    function refreshLog() {
-      if (document.hidden) return;           // 后台标签页不轮询，省带宽与设备负载
-      if (logLoading) return;                // 防止手动刷新/自动轮询并发，把同一批日志拼两遍
+    function setLogStatus(text) {
+      var s = document.getElementById('logStatus');
+      if (s) s.textContent = text || '';
+    }
+    function renderLogView(emptyText) {
       var el = document.getElementById('logView');
-      var reqSince = logSince, reqGen = logViewGen;
+      if (!el) return;
+      el.textContent = logLines.length ? logLines.join('\n') : (emptyText == null ? '(暂无日志)' : emptyText);
+      el.scrollTop = el.scrollHeight;
+    }
+    function initLogPanel() {
+      reloadLog();
+      var auto = document.getElementById('logAuto');
+      if (!auto || auto.checked) startLogPoll();
+      else stopLogPoll();
+    }
+    function clearLogUI() {
+      logLines = [];
+      renderLogView('');
+      setLogStatus('显示已清空，自动刷新只显示新日志');
+    }
+    function reloadLog() {
+      logLines = [];
+      logSince = 0;
+      renderLogView('加载中...');
+      refreshLog(true);
+    }
+    function refreshLog(fullReload) {
+      fullReload = !!fullReload;
+      if (document.hidden && !fullReload) return;  // 后台标签页不轮询，省带宽与设备负载
+      if (logLoading) return;
+      var el = document.getElementById('logView');
+      if (!el) return;
+      var reqSince = fullReload ? 0 : logSince;
       logLoading = true;
-      fetch('/log?since=' + reqSince).then(function(r) { return r.json(); }).then(function(d) {
-        if (reqGen !== logViewGen) return;   // 清空显示后返回的旧响应直接丢弃
+      if (fullReload) setLogStatus('正在加载设备端保留日志...');
+      fetch('/log?since=' + reqSince + '&_=' + Date.now(), { cache: 'no-store' }).then(function(r) { return r.json(); }).then(function(d) {
         if (!d || !Array.isArray(d.lines)) return;
-        if (d.seq < logSince) logLines = [];  // 序号回退(设备重启) -> 重置
-        if (reqSince !== logSince && d.seq <= logSince) return;  // 过期响应，不重复追加
+        if (fullReload || d.seq < logSince) logLines = [];  // 重载/设备重启 -> 重置
         logSince = d.seq;
         if (d.lines.length) {
           logLines = logLines.concat(d.lines);
           if (logLines.length > 500) logLines = logLines.slice(logLines.length - 500);
-          el.textContent = logLines.join('\n');
-          el.scrollTop = el.scrollHeight;
-        } else if (el.textContent === '加载中...') {
-          el.textContent = '(暂无日志)';
+          renderLogView();
+        } else if (fullReload || el.textContent === '加载中...') {
+          renderLogView('(暂无日志)');
         }
+        setLogStatus('设备端序号 ' + logSince + '，本页显示 ' + logLines.length + ' 条');
       }).catch(function() {
-        if (el.textContent === '加载中...') el.textContent = '无法获取日志';
+        if (fullReload || el.textContent === '加载中...') {
+          renderLogView('无法获取日志');
+          setLogStatus('日志请求失败');
+        }
       }).finally(function() {
         logLoading = false;
       });
@@ -913,7 +1087,7 @@
     }
 
     document.addEventListener('DOMContentLoaded', function() {
-      switchPanel('overview');
+      switchPanel(panelFromHash());
     });
     // ---- 设置表单 AJAX 原地保存：拦截所有 /save 表单，不再整页跳转 ----
     function showSaved(ok, msg) {

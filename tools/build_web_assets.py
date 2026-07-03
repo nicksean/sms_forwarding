@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""生成 ESP32 Web UI 的 gzip PROGMEM 资源。
+"""生成 ESP32 Web UI 的 gzip 静态资源。
 
 源文件位于 code/web_src/，本脚本输出 code/web_assets.h/.cpp。
 设备端只发送 gzip 字节，浏览器负责解压；不要在 ESP32 上运行压缩。
+生成文件不依赖运行时 API，由 ESP-IDF 的 web_assets 组件链接。
 """
 
 from __future__ import annotations
@@ -121,7 +122,8 @@ def build_assets() -> tuple[str, str]:
     header = f"""#ifndef WEB_ASSETS_H
 #define WEB_ASSETS_H
 
-#include <Arduino.h>
+#include <stddef.h>
+#include <stdint.h>
 
 struct WebAsset {{
   const uint8_t* data;
@@ -135,14 +137,20 @@ extern const WebAsset WEB_INDEX;
 extern const WebAsset WEB_APP_CSS;
 extern const WebAsset WEB_APP_JS;
 
-const WebAsset* findWebPanelAsset(const String& name);
+const WebAsset* findWebPanelAsset(const char* name);
 
 #endif
 """
 
     cpp_parts = [
         '#include "web_assets.h"',
+        "#include <string.h>",
+        "#if defined(ARDUINO)",
         "#include <pgmspace.h>",
+        "#define WEB_ASSET_STORAGE PROGMEM",
+        "#else",
+        "#define WEB_ASSET_STORAGE",
+        "#endif",
         "",
         "// 此文件由 tools/build_web_assets.py 生成；请修改 code/web_src/ 后重新生成。",
         f'const char WEB_ASSET_HASH[] = "{rev}";',
@@ -150,7 +158,7 @@ const WebAsset* findWebPanelAsset(const String& name);
     ]
     for asset in assets:
         arr_name = f"{asset.var}_DATA"
-        cpp_parts.append(f"static const uint8_t {arr_name}[] PROGMEM = {{")
+        cpp_parts.append(f"static const uint8_t {arr_name}[] WEB_ASSET_STORAGE = {{")
         cpp_parts.append(c_array(asset.gz))
         cpp_parts.append("};")
         cpp_parts.append(
@@ -158,9 +166,10 @@ const WebAsset* findWebPanelAsset(const String& name);
         )
         cpp_parts.append("")
 
-    cpp_parts.append("const WebAsset* findWebPanelAsset(const String& name) {")
+    cpp_parts.append("const WebAsset* findWebPanelAsset(const char* name) {")
+    cpp_parts.append("  if (!name) return nullptr;")
     for name in PANELS:
-        cpp_parts.append(f'  if (name == "{name}") return &WEB_PANEL_{name.upper()};')
+        cpp_parts.append(f'  if (strcmp(name, "{name}") == 0) return &WEB_PANEL_{name.upper()};')
     cpp_parts.append("  return nullptr;")
     cpp_parts.append("}")
     cpp = "\n".join(cpp_parts) + "\n"
