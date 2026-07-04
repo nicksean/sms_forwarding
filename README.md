@@ -6,19 +6,128 @@
   <a href="https://linux.do"><img alt="LINUX DO" src="https://img.shields.io/badge/LINUX-DO-FFB003.svg?logo=data:image/svg%2bxml;base64,DQo8c3ZnIHhtbG5zPSJodHRwOi8vd3d3LnczLm9yZy8yMDAwL3N2ZyIgd2lkdGg9IjEwMCIgaGVpZ2h0PSIxMDAiPjxwYXRoIGQ9Ik00Ni44Mi0uMDU1aDYuMjVxMjMuOTY5IDIuMDYyIDM4IDIxLjQyNmM1LjI1OCA3LjY3NiA4LjIxNSAxNi4xNTYgOC44NzUgMjUuNDV2Ni4yNXEtMi4wNjQgMjMuOTY4LTIxLjQzIDM4LTExLjUxMiA3Ljg4NS0yNS40NDUgOC44NzRoLTYuMjVxLTIzLjk3LTIuMDY0LTM4LjAwNC0yMS40M1EuOTcxIDY3LjA1Ni0uMDU0IDUzLjE4di02LjQ3M0MxLjM2MiAzMC43ODEgOC41MDMgMTguMTQ4IDIxLjM3IDguODE3IDI5LjA0NyAzLjU2MiAzNy41MjcuNjA0IDQ2LjgyMS0uMDU2IiBzdHlsZT0ic3Ryb2tlOm5vbmU7ZmlsbC1ydWxlOmV2ZW5vZGQ7ZmlsbDojZWNlY2VjO2ZpbGwtb3BhY2l0eToxIi8+PHBhdGggZD0iTTQ3LjI2NiAyLjk1N3EyMi41My0uNjUgMzcuNzc3IDE1LjczOGE0OS43IDQ5LjcgMCAwIDEgNi44NjcgMTAuMTU3cS00MS45NjQuMjIyLTgzLjkzIDAgOS43NS0xOC42MTYgMzAuMDI0LTI0LjM4N2E2MSA2MSAwIDAgMSA5LjI2Mi0xLjUwOCIgc3R5bGU9InN0cm9rZTpub25lO2ZpbGwtcnVsZTpldmVub2RkO2ZpbGw6IzE5MTkxOTtmaWxsLW9wYWNpdHk6MSIvPjxwYXRoIGQ9Ik03Ljk4IDcwLjkyNmMyNy45NzctLjAzNSA1NS45NTQgMCA4My45My4xMTNRODMuNDI2IDg3LjQ3MyA2Ni4xMyA5NC4wODZxLTE4LjgxIDYuNTQ0LTM2LjgzMi0xLjg5OC0xNC4yMDMtNy4wOS0yMS4zMTctMjEuMjYyIiBzdHlsZT0ic3Ryb2tlOm5vbmU7ZmlsbC1ydWxlOmV2ZW5vZGQ7ZmlsbDojZjlhZjAwO2ZpbGwtb3BhY2l0eToxIi8+PC9zdmc+" /></a>
 </p>
 
-ESP32-C3 + ML307 系列 4G/LTE 模组的短信转发固件。设备通过 UART/AT 接收 PDU 短信，解码后经 WiFi 转发到邮件和最多 5 个推送通道，并提供 Web UI 做配置、诊断、日志、OTA 和保号任务。
+ESP32-C3 + ML307 系列 4G/LTE 模组的轻量短信转发固件。设备通过 UART/AT 接收 PDU 短信，在本地完成中文短信、长短信、去重和规则判断，然后经 WiFi 转发到邮件与最多 5 个推送通道，并提供 Web UI 完成配置、诊断、日志、OTA、保号和定时任务。
 
-本仓库现在只保留 **原生 ESP-IDF** 固件；Arduino fallback 已移除。
+本仓库现在只保留 **原生 ESP-IDF** 固件；Arduino fallback 已移除。项目目标不是做一个“能跑的 demo”，而是做一套适合长期插电、无人值守、可 OTA、可排障、资源占用可控的短信网关固件。
 
-## 功能
 
-- PDU 短信接收，支持中文短信和长短信合并。
-- `+CMT` URC 与 `AT+CMGL` 存储轮询双路径接收，去重后转发。
-- 邮件 SMTP、POST JSON、Bark（官方/自建）、GET、钉钉、PushPlus、Server酱、自定义模板、飞书、Gotify、Telegram。
-- 推送/邮件后台 worker、失败重试、通道冷却，避免阻塞短信接收和 Web UI。
-- Web UI：配置、收件箱、日志、AT 终端、WiFi 配网、OTA、状态面板、保号任务。
-- NVS 持久化配置，支持 SoftAP 配网与 `sms.local` mDNS。
-- 蜂窝 HTTP/SMS/USSD 保号动作，默认转发仍走 WiFi，不消耗蜂窝流量。
+## 项目特点
+
+### 原生 ESP-IDF 固件
+
+- 基于 ESP-IDF 5.x，目标芯片为 ESP32-C3。
+- 使用组件化结构拆分配置、WiFi、Web、模组、短信、推送、日志和收件箱。
+- 通过 CI 持续构建，减少“本地能编过、换环境不行”的问题。
+- Web UI 使用 `code/web_src/` 维护源码，再打包为 gzip 静态资源链接进固件。
+
+### 稳定的短信接收链路
+
+- 支持 PDU 模式短信接收，覆盖中文短信和长短信合并。
+- 同时使用 `+CMT`/`+CMTI` URC 与周期性 `AT+CMGL` 存储轮询，单一路径丢事件时仍可补收。
+- 接收侧做短信去重、黑名单、管理员命令和收件箱缓存。
+- 默认短信转发走 WiFi，蜂窝网络主要用于可选的保号 HTTP、短信或 USSD 动作。
+
+### 异步队列设计
+
+- `idf_modem` 独占 UART1，所有 AT 命令串行化，避免多个任务同时抢模组。
+- 短信接收、Web 请求、推送、邮件、保号、定时任务分层处理，慢操作尽量进入后台 worker。
+- 推送/邮件使用队列、失败重试和通道冷却，降低 TLS、SMTP 或外部服务抖动对短信接收的影响。
+- Web 表单保存按页面和配置域拆分，点击哪里的保存只影响对应配置，减少全量保存带来的连带风险。
+- 定时保号、每日心跳、每日重启、低堆保护由 Web scheduler 统一调度，耗时动作再交给后台执行。
+
+### 多通道转发
+
+- 邮件 SMTP。
+- POST JSON、自定义 GET、自定义模板。
+- Bark 官方/自建、钉钉、PushPlus、Server 酱、飞书、Gotify、Telegram。
+- 最多 5 个推送通道，可按规则决定是否转发到指定通道。
+
+### Web 管理与维护
+
+- Web UI 覆盖系统概览、转发配置、短信收发、定时任务、诊断控制、日志查看和 OTA。
+- 支持 SoftAP 配网、`sms.local` mDNS、NTP 时间同步、AT 终端和运行状态查看。
+- 日志进入 120 行环形缓冲，便于无串口时从 Web 排障。
+- OTA 双分区升级，配合崩溃转储分区，方便远程升级和异常分析。
+
+## 项目架构
+
+固件入口在 `main/app_main.cpp`，启动后按“配置 -> 网络 -> 模组 -> 短信 -> 推送/Web”的顺序初始化各组件。运行时尽量保持单一职责：模组 AT 只由 `idf_modem` 访问，短信接收只负责解码和入队，推送和邮件交给后台 worker，Web handler 只做参数解析和轻量响应。
+
+```text
+main/app_main.cpp
+  ├─ idf_config      NVS 配置、默认值、表单保存、导入导出
+  ├─ idf_wifi        STA/SoftAP 配网、DNS 门户、mDNS、SNTP、重连 watchdog
+  ├─ idf_modem       UART1 单 owner、AT 串行化、蜂窝 HTTP/SMS/USSD
+  ├─ idf_sms         PDU 收发、长短信合并、去重、黑名单、管理员命令
+  ├─ idf_push        邮件/推送 worker、失败重试、通道冷却、规则判断
+  ├─ idf_web         HTTP 路由、Web UI、OTA、状态、日志、定时任务
+  ├─ idf_esim        eUICC APDU/ES10c 基础能力与配置入口
+  ├─ idf_inbox       收件箱/已发送记录的本地环形缓存
+  ├─ idf_logbuf      Web 可见日志环形缓冲
+  ├─ idf_pdu         PDU 编解码组件
+  └─ web_assets      gzip Web 静态资源
+```
+
+核心数据流：
+
+```text
+ML307 UART URC / AT+CMGL 轮询
+  -> idf_modem 串行 AT 收发
+  -> idf_sms PDU 解码、长短信合并、去重、规则预处理
+  -> idf_inbox 本地留存
+  -> idf_push 转发队列
+  -> SMTP / Bark / Telegram / Gotify / 自定义 HTTP 等通道
+```
+
+Web 侧数据流：
+
+```text
+浏览器 Web UI
+  -> idf_web HTTP 路由
+  -> idf_config 局部保存配置
+  -> scheduler / worker queue 执行慢任务
+  -> idf_logbuf / status JSON 返回运行状态
+```
+
+这种结构的重点是把“容易慢”的动作从请求处理和短信接收路径上移开。外部推送服务慢、SMTP 握手慢、保号 HTTP 超时、浏览器多标签页刷新，都不应该直接卡住 UART 收短信。
+
+## 固件分区
+
+当前默认面向 4MB Flash，使用自定义分区表 `partitions_ota_1m6.csv`：
+
+| 分区 | 大小 | 用途 |
+| --- | ---: | --- |
+| `nvs` | 20KB | 系统配置与基础参数 |
+| `otadata` | 8KB | OTA 启动选择信息 |
+| `app0` | 1.625MB | OTA 固件槽位 0 |
+| `app1` | 1.625MB | OTA 固件槽位 1 |
+| `smsdata` | 640KB | 短信、收件箱等本地数据，使用 NVS 磨损均衡与掉电原子写入 |
+| `coredump` | 64KB | 崩溃转储，便于定位无人值守设备的异常 |
+
+`app0`/`app1` 保留双 OTA 槽位，每个槽位 1.625MB。当前固件大小约 1.24MB，单槽仍有约 24% 余量，可继续容纳后续 eSIM、诊断和 UI 功能。`smsdata` 单独放大，避免短信留存和普通配置共用很小的 NVS 空间。
+
+## 体积与内存优化
+
+- 编译使用 `-Os` 尺寸优化，并减少断言字符串带来的 rodata 占用。
+- 关闭项目不使用的 IPv6、termios、WiFi NVS 等能力，减少 flash 和 RAM 占用。
+- WiFi 收发路径、FreeRTOS 与 ringbuf 部分函数放回 flash，释放 ESP32-C3 紧张的 IRAM。
+- TLS 使用动态缓冲和会话后释放策略，空闲期减少堆占用。
+- socket 上限提高到 20，适配多浏览器标签页、mDNS、SNTP、推送和 SMTP 并存的场景。
+- SNTP 配置主服务器和兜底服务器，单个 NTP 不可达时不影响时间同步。
+- 启用 flash coredump，异常重启后仍能保留定位信息。
+
+## 稳定性验证
+
+近期在真实设备上做过一轮针对 Web 与后台队列的压力验证：
+
+- 设备通过 COM5 烧录后运行，Web 访问地址为局域网 IP。
+- 版本号验证到 `1.0.5`，模组状态、队列状态、时间同步、推送通道等状态页字段正常。
+- Web 路由 4 并发压力测试通过，`2223/2223` 请求成功，错误数为 0，未观察到异常日志。
+- 10 分钟轮询压力测试通过，`2484/2484` 请求成功。
+- 待转发、推送队列、待发短信、邮件队列在空闲状态下保持 `0 / 0 / 0 / 0`。
+- 对 NET LED 保存、页面局部保存、APN 显示、保号任务布局等近期问题做过回归验证。
+
+这些验证不能替代长期老化测试，但已经覆盖了多页面轮询、配置保存、Web 刷新、后台任务和模组状态读取并发时的主要风险点。
 
 ## Web UI 预览
 
@@ -41,24 +150,77 @@ start preview\index.html
 | --- | --- |
 | ![诊断与控制](assets/ui-diagnose.png) | ![系统日志](assets/ui-log.png) |
 
-## 构建与烧录
+## 烧录教程
 
-本机推荐使用封装脚本：
+### 1. 准备环境
+
+推荐环境：
+
+- Windows + PowerShell。
+- ESP32-C3 开发板或 ESP32-C3 Super Mini。
+- ML307 系列 4G/LTE 模组。
+- USB 数据线和对应串口驱动。
+- ESP-IDF 5.5.4。仓库脚本默认查找 `E:\Espressif\esp-idf-v5.5.4`，也可以通过 `IDF_PATH` 和 `IDF_TOOLS_PATH` 环境变量指定自己的安装位置。
+
+确认串口号：
+
+```powershell
+Get-CimInstance Win32_SerialPort | Select-Object DeviceID,Description
+```
+
+如果设备显示为 `COM5`，后续命令就使用 `-Port COM5`；如果是其他端口，把命令里的端口替换掉。
+
+### 2. 拉取并进入项目
+
+```powershell
+git clone https://github.com/MineSunshineone/sms_forwarding.git
+cd sms_forwarding
+```
+
+已有仓库时直接进入项目目录即可：
+
+```powershell
+cd E:\GitHub-Repo\sms_forwarding
+```
+
+### 3. 构建固件
+
+仓库提供了 ESP-IDF 封装脚本，会自动加载 ESP-IDF 环境，并把构建产物放在 `build/idf`，把 `sdkconfig` 放在 `build/sdkconfig`：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File tools\idf.ps1 build
-powershell -ExecutionPolicy Bypass -File tools\idf.ps1 flash -Port COM5
-powershell -ExecutionPolicy Bypass -File tools\idf.ps1 monitor -Port COM5
 ```
 
-Web UI 修改后先生成资源：
+如果只改了 Web UI 源码，构建前先重新生成静态资源：
 
 ```powershell
 python tools\build_web_assets.py
 python tools\build_web_assets.py --check
 ```
 
-CI 使用 `.github/workflows/build.yml` 构建 ESP-IDF 固件。
+### 4. 烧录到 ESP32-C3
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools\idf.ps1 flash -Port COM5
+```
+
+如果自动进入下载模式失败，可以按住开发板 `BOOT`，轻点 `RST/EN`，开始烧录后松开 `BOOT`。不同 ESP32-C3 开发板按钮名称可能不同，以板子丝印为准。
+
+### 5. 打开串口日志
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools\idf.ps1 monitor -Port COM5
+```
+
+`monitor` 中可以看到 WiFi 连接、模组初始化、短信接收、推送、Web 访问和崩溃原因等日志。退出 monitor 通常使用 `Ctrl+]`。
+
+### 6. 首次访问 Web UI
+
+首次启动时设备会优先连接已保存 WiFi；如果没有配置或连接失败，会开启开放热点 `SMS-Forwarder-XXXX`。连接热点后访问 `http://192.168.1.1` 配网；设备连上路由器后，可通过串口日志里的 IP 地址或 `http://sms.local` 打开 Web UI。
+
+默认账号密码为 `admin` / `admin123`，首次使用请立即修改。
+
+CI 使用 `.github/workflows/build.yml` 构建 ESP-IDF 固件，日常本地开发建议仍使用 `tools\idf.ps1`，这样构建目录和配置文件位置保持一致。
 
 ## Bark 推送
 
@@ -68,13 +230,7 @@ CI 使用 `.github/workflows/build.yml` 构建 ESP-IDF 固件。
 - `Device Key` 填 Bark App 中显示的 key；兼容旧配置里直接填写 `https://api.day.app/<key>` 的方式。
 - `可选参数` 使用 URL query 风格，例如 `group=SMS&sound=bell&level=timeSensitive&icon=https%3A%2F%2Fexample.com%2Ficon.png`；支持 Bark 的 `subtitle`、`level`、`badge`、`sound`、`group`、`icon`、`url`、`copy`、`isArchive` 等参数。
 
-## 首次使用
-
-1. 烧录后设备会优先使用 NVS 中保存的 WiFi。
-2. 如果没有 WiFi 或连接失败，会开启开放配网热点 `SMS-Forwarder-XXXX`。
-3. 连接热点后访问 `http://192.168.1.1` 配置 WiFi。
-4. 连接路由器后可通过设备 IP 或 `http://sms.local` 访问 Web UI。
-5. 默认 Web 账号密码为 `admin` / `admin123`，首次使用请立即修改。
+## 出厂 WiFi 配置
 
 可选：本地创建 `code/wifi_config.h` 作为出厂 WiFi seed（该文件被 `.gitignore` 忽略）：
 

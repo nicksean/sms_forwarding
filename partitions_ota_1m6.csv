@@ -1,5 +1,5 @@
 # Name,   Type, SubType, Offset,  Size, Flags
-# app0/app1 各 1.625MB(0x1A0000)：当前固件 ~1.06MB，留 ~35% 余量给后续功能(如 eSIM)。
+# app0/app1 各 1.625MB(0x1A0000)：当前固件 ~1.24MB，单槽仍留约 24% 余量给后续功能(如 eSIM)。
 # smsdata(NVS) 640KB：短信本地留存，NVS 自带磨损均衡+掉电原子，远超实际用量、留足寿命headroom。
 nvs,      data, nvs,     0x9000,  0x5000,
 otadata,  data, ota,     0xe000,  0x2000,
