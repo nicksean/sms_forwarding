@@ -61,8 +61,8 @@ void idf_modem_signal_event(void);
 IdfModemStatus idf_modem_get_status(void);
 // AT 通道当前是否空闲（Web 路由用于"模组正忙"快速返回，避免长时间阻塞 httpd 任务）
 bool idf_modem_at_idle(void);
-// 记录一次网页状态轮询：概览页打开期间信号采样自动提频(10s/30s)，无人查看恢复默认(30s/120s)
-void idf_modem_note_web_poll(void);
+// 用户显式请求刷新概览模组信息时，短时间打开展示型身份/信号采样窗口。
+void idf_modem_request_status_sample(void);
 // 计划内 ESP 重启(网页重启/每日定时重启/低堆重启)前调用：拉低 EN 让模组彻底断电，
 // 重启后走全新上电。保留"重启设备可救活 AT 正常但收信已死的模组"的原有语义；
 // 热启动快路径只服务于崩溃/看门狗等意外复位

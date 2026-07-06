@@ -16,4 +16,17 @@
           <p class="form-hint">设备在内存中保留最近 120 条日志（重启清空），本页打开期间会持续累积新日志。</p>
         </div>
       </div>
+      <div class="card">
+        <div class="card-header">上次运行日志（重启前）</div>
+        <div class="card-body">
+          <div id="prevLogView" class="log-view-secondary">尚未加载</div>
+          <div class="log-toolbar">
+            <button class="btn btn-secondary btn-sm" onclick="loadPrevLog(this)">加载上次日志</button>
+            <button class="btn btn-secondary btn-sm" onclick="location.href='/prevlog?dl=1'">下载上次日志</button>
+            <button class="btn btn-secondary btn-sm" onclick="location.href='/coredump'">下载崩溃转储</button>
+            <button class="btn btn-secondary btn-sm" onclick="clearCoredump(this)">清除崩溃转储</button>
+          </div>
+          <p class="form-hint">重启前的日志会自动保留在内存中（软件重启/看门狗/崩溃后仍可查看）；异常复位时会在启动完成后后台写入 Flash，但只有点击加载或下载时才读取。崩溃转储（coredump）可用 espcoredump.py 解析完整回溯定位崩溃点。</p>
+        </div>
+      </div>
     </div>

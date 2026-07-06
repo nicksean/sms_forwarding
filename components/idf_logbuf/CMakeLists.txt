@@ -3,4 +3,7 @@ idf_component_register(
   INCLUDE_DIRS "include"
   REQUIRES
     freertos
+  PRIV_REQUIRES
+    esp_system
+    nvs_flash
 )

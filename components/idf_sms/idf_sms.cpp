@@ -116,6 +116,20 @@ static std::string trim(std::string value)
     return value.substr(start, end - start);
 }
 
+// SIM 存储索引 0 是合法值；必须严格解析，不能让乱码被宽松转换成 0。
+static bool parse_sms_index_token(const char* start, size_t len, int& index)
+{
+    if (!start || len == 0 || len > 5) return false;
+    int parsed = 0;
+    for (size_t i = 0; i < len; ++i) {
+        unsigned char ch = static_cast<unsigned char>(start[i]);
+        if (!isdigit(ch)) return false;
+        parsed = parsed * 10 + static_cast<int>(ch - '0');
+    }
+    index = parsed;
+    return true;
+}
+
 static bool starts_with(const std::string& text, const char* prefix)
 {
     return text.rfind(prefix, 0) == 0;
@@ -386,13 +400,10 @@ static int parse_cmti_index(const std::string& line)
 {
     size_t comma = line.rfind(',');
     if (comma == std::string::npos || comma + 1 >= line.size()) return -1;
-    // 必须全为数字：atoi 对乱码返回 0，而 0 是合法 SIM 索引，会误读/误删真实短信
     std::string num = trim(line.substr(comma + 1));
-    if (num.empty() || num.size() > 5) return -1;
-    for (char ch : num) {
-        if (!isdigit(static_cast<unsigned char>(ch))) return -1;
-    }
-    return atoi(num.c_str());
+    int index = -1;
+    if (!parse_sms_index_token(num.c_str(), num.size(), index)) return -1;
+    return index;
 }
 
 static int parse_cmgl_index(const std::string& line)
@@ -402,11 +413,11 @@ static int parse_cmgl_index(const std::string& line)
     while (*++p && isspace(static_cast<unsigned char>(*p))) {}
     const char* start = p;
     while (*p && isdigit(static_cast<unsigned char>(*p))) ++p;
-    if (p == start) return -1;
-    if (p - start > 5) return -1;
+    int index = -1;
+    if (!parse_sms_index_token(start, static_cast<size_t>(p - start), index)) return -1;
     while (*p && isspace(static_cast<unsigned char>(*p))) ++p;
     if (*p != ',' && *p != '\0') return -1;
-    return atoi(start);
+    return index;
 }
 
 static void clear_concat_slot(ConcatSlot& slot)
@@ -547,10 +558,15 @@ static void handle_decoded_pdu(const DecodedSms& sms)
 static bool decode_pdu_line(const std::string& line)
 {
     if (!is_hex_string(line)) return false;
-    if (!s_pdu_mutex || xSemaphoreTake(s_pdu_mutex, pdMS_TO_TICKS(2000)) != pdTRUE) {
-        idf_log_line("PDU 解码器忙，短信暂未处理");
-        return false;
+    if (!s_pdu_mutex) return false;
+    // 解码器忙(网页发短信正在编码)时重试而不是放弃：返回 false 会被调用方
+    // 当成"PDU 损坏"——直推短信直接丢失，存储短信还会被误删
+    bool locked = false;
+    for (int attempt = 0; attempt < 3 && !locked; ++attempt) {
+        locked = xSemaphoreTake(s_pdu_mutex, pdMS_TO_TICKS(2000)) == pdTRUE;
+        if (!locked) idf_log_line("PDU 解码器忙，等待重试...");
     }
+    if (!locked) return false;
     DecodedSms decoded;
     if (!s_pdu.decodePDU(line.c_str())) {
         xSemaphoreGive(s_pdu_mutex);
@@ -706,6 +722,11 @@ static void backfill_stored_sms(bool announce)
     // 每轮最多处理 5 条就归还控制权：处理间隙主循环能继续排空 URC、检查长短信超时、
     // 发送网页短信。剩余的通过 s_backfill_pending 在 ~500ms 后接着处理。
     constexpr int BATCH_MAX = 5;
+    // 连续多轮"有缺 PDU 行的条目且毫无进展"的计数：损坏记录若只重试不删除，
+    // 会形成每 ~200ms 一次 AT+CMGL 的永久轮询，把整个 AT 通道饿死
+    static uint8_t s_nopdu_stall_rounds = 0;
+    int nopdu_idx[BATCH_MAX];
+    int nopdu_count = 0;
     int processed = 0;
     int handled = 0;
     bool more_left = false;
@@ -752,8 +773,30 @@ static void backfill_stored_sms(bool announce)
             ++handled;
         } else if (idx >= 0) {
             idf_logf("CMGL 索引=%d 缺少 PDU 行，暂不删除", idx);
+            if (nopdu_count < BATCH_MAX) nopdu_idx[nopdu_count++] = idx;
+        }
+    }
+
+    if (nopdu_count > 0) {
+        if (handled > 0 || processed > 0) {
+            // 本轮有进展：缺行大概率是 8KB 响应截断，删掉已处理的条目后下轮自然恢复
+            s_nopdu_stall_rounds = 0;
+            s_backfill_pending = true;
+        } else if (++s_nopdu_stall_rounds >= 3) {
+            // 连续 3 轮原地踏步 = 记录本身损坏，删除释放存储，终结轮询死循环
+            for (int i = 0; i < nopdu_count; ++i) {
+                idf_logf("索引=%d 连续多轮缺少 PDU 行(记录损坏)，删除以恢复正常轮询", nopdu_idx[i]);
+                char cmd[24];
+                snprintf(cmd, sizeof(cmd), "AT+CMGD=%d", nopdu_idx[i]);
+                std::string ignored;
+                idf_modem_send_at(cmd, 2000, ignored);
+            }
+            s_nopdu_stall_rounds = 0;
+        } else {
             s_backfill_pending = true;
         }
+    } else {
+        s_nopdu_stall_rounds = 0;
     }
 
     if (more_left) s_backfill_pending = true;
@@ -762,8 +805,8 @@ static void backfill_stored_sms(bool announce)
 
 static void sms_task(void*)
 {
-    uint32_t last_poll_ms = 0;
-    uint32_t start_ms = static_cast<uint32_t>(esp_timer_get_time() / 1000ULL);
+    uint64_t last_poll_ms = 0;  // 64 位毫秒：32 位在 49.7 天回绕会重进启动提频窗口
+    uint64_t start_ms = static_cast<uint64_t>(esp_timer_get_time()) / 1000ULL;
     uint32_t poll_count = 0;
     uint8_t reassert_step = 0;  // 1=CMGF, 2=CNMI；拆帧避免一次堆多条 AT
     bool backfill_after_reassert = false;
@@ -804,7 +847,7 @@ static void sms_task(void*)
             if (backfill_after_reassert) {
                 backfill_after_reassert = false;
                 backfill_stored_sms(false);
-                last_poll_ms = static_cast<uint32_t>(esp_timer_get_time() / 1000ULL);
+                last_poll_ms = static_cast<uint64_t>(esp_timer_get_time()) / 1000ULL;
                 vTaskDelay(pdMS_TO_TICKS(200));
                 continue;
             }
@@ -829,12 +872,12 @@ static void sms_task(void*)
             if (s_backfill_pending) {
                 s_backfill_pending = false;
                 backfill_stored_sms(false);
-                last_poll_ms = static_cast<uint32_t>(esp_timer_get_time() / 1000ULL);
+                last_poll_ms = static_cast<uint64_t>(esp_timer_get_time()) / 1000ULL;
                 vTaskDelay(pdMS_TO_TICKS(200));
                 continue;
             }
 
-            uint32_t now_ms = static_cast<uint32_t>(esp_timer_get_time() / 1000ULL);
+            uint64_t now_ms = static_cast<uint64_t>(esp_timer_get_time()) / 1000ULL;
             uint32_t interval = (now_ms - start_ms < SMS_STARTUP_FAST_WINDOW_MS)
                 ? SMS_STARTUP_POLL_INTERVAL_MS
                 : SMS_POLL_INTERVAL_MS;

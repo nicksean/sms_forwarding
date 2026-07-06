@@ -49,6 +49,11 @@ static constexpr uint32_t PUSH_RETRY_BASE_SEC = 20;
 static constexpr uint32_t PUSH_RETRY_MAX_SEC = 600;
 static constexpr int HTTP_TIMEOUT_MS = 5000;
 static constexpr int SMTP_TIMEOUT_MS = 15000;
+// 单次 SMTP 会话总时长硬上限：所有收发环节共享。没有它，"活着但极慢"的
+// 服务器(每次只收几字节/逐行慢吐)能把唯一的推送 worker 卡住几分钟到无限,
+// 转发队列随之塞满，且 s_busy 常真还会抑制低内存自愈重启
+static constexpr int64_t SMTP_SESSION_MAX_US = 120LL * 1000LL * 1000LL;
+static int64_t s_smtp_session_deadline = 0;  // 仅推送 worker 单任务访问
 static constexpr uint32_t PUSH_WORKER_STACK = 10240;
 // 最大可分配块低于该值时推迟 TLS 发送，避免握手中途 OOM(mbedTLS 握手峰值需 ~40KB)
 static constexpr size_t TLS_MIN_FREE_HEAP = 50000;
@@ -222,6 +227,20 @@ static std::string trim(std::string value)
     size_t end = value.size();
     while (end > start && isspace(static_cast<unsigned char>(value[end - 1]))) --end;
     return value.substr(start, end - start);
+}
+
+static bool parse_push_channel_token(const std::string& value, uint8_t& channel)
+{
+    if (value.empty()) return false;
+    uint32_t parsed = 0;
+    for (char ch : value) {
+        if (!isdigit(static_cast<unsigned char>(ch))) return false;
+        parsed = parsed * 10U + static_cast<uint32_t>(ch - '0');
+        if (parsed > IDF_MAX_PUSH_CHANNELS) return false;
+    }
+    if (parsed == 0) return false;
+    channel = static_cast<uint8_t>(parsed);
+    return true;
 }
 
 static void json_escape_append(std::string& out, const std::string& value)
@@ -593,8 +612,8 @@ static ForwardDecision eval_forward_rules(const std::string& rules, const std::s
             if (tok == "drop") d.drop = true;
             else if (tok == "email") d.email = true;
             else {
-                int ch = atoi(tok.c_str());
-                if (ch >= 1 && ch <= IDF_MAX_PUSH_CHANNELS) d.chMask |= 1u << (ch - 1);
+                uint8_t ch = 0;
+                if (parse_push_channel_token(tok, ch)) d.chMask |= 1u << (ch - 1);
             }
             if (comma == action.size()) break;
             ap = comma + 1;
@@ -622,8 +641,10 @@ static esp_err_t http_request(const std::string& url, const char* method,
     cfg.timeout_ms = HTTP_TIMEOUT_MS;
     cfg.crt_bundle_attach = esp_crt_bundle_attach;
     cfg.keep_alive_enable = false;
-    // 默认 TX 缓冲 512B 放不下长短信的 GET 请求行(百分号编码后可达 1.4KB+)
-    cfg.buffer_size_tx = 2048;
+    // 默认 TX 缓冲 512B 放不下长短信的 GET 请求行(百分号编码后可达 1.4KB+)；
+    // 长合并短信(中文×百分号编码可膨胀 9 倍)按实际 URL 长度放宽，避免必败重试
+    size_t tx_need = url.size() + 512;
+    cfg.buffer_size_tx = static_cast<int>(tx_need < 2048 ? 2048 : tx_need);
     esp_http_client_handle_t client = esp_http_client_init(&cfg);
     if (!client) return ESP_ERR_NO_MEM;
 
@@ -889,9 +910,12 @@ static bool smtp_conn_write_all(SmtpConn& conn, const std::string& data)
         if (n > 0) {
             sent += static_cast<size_t>(n);
             deadline = esp_timer_get_time() + static_cast<int64_t>(SMTP_TIMEOUT_MS) * 1000LL;
+            // 有进展也要看会话总限：每次只肯收几字节的服务器不能无限续期
+            if (s_smtp_session_deadline && esp_timer_get_time() >= s_smtp_session_deadline) return false;
             continue;
         }
         if (esp_timer_get_time() >= deadline) return false;
+        if (s_smtp_session_deadline && esp_timer_get_time() >= s_smtp_session_deadline) return false;
         vTaskDelay(pdMS_TO_TICKS(20));
     }
     return true;
@@ -916,11 +940,12 @@ static int smtp_read_response(SmtpConn& conn, std::string& response, uint32_t ti
     char buf[128];
     int final_code = -1;
     int64_t deadline = esp_timer_get_time() + static_cast<int64_t>(timeout_ms) * 1000LL;
+    if (s_smtp_session_deadline && s_smtp_session_deadline < deadline) deadline = s_smtp_session_deadline;
     while (esp_timer_get_time() < deadline) {
         ssize_t n = smtp_conn_read(conn, buf, sizeof(buf));
         if (n < 0) return final_code;  // 连接已关闭/出错，不再空等整个超时窗口
         if (n > 0) {
-            if (response.size() < 2048) response.append(buf, std::min<size_t>(n, 2048 - response.size()));
+            response.append(buf, static_cast<size_t>(n));
             size_t pos = 0;
             while (pos < response.size()) {
                 size_t eol = response.find('\n', pos);
@@ -934,6 +959,10 @@ static int smtp_read_response(SmtpConn& conn, std::string& response, uint32_t ti
                 }
                 pos = eol + 1;
             }
+            // 丢弃已解析的行，只保留未完结的尾行：既限住内存，
+            // 又保证超长多行横幅(>2KB)之后的终结状态行仍能被识别
+            if (pos > 0) response.erase(0, pos);
+            if (response.size() >= 2048) return final_code;  // 单行超 2KB=协议垃圾
         } else {
             vTaskDelay(pdMS_TO_TICKS(30));
         }
@@ -1036,6 +1065,8 @@ static bool send_smtp_email(const IdfEmailSettingsView& cfg, const std::string& 
 
     bool ok = false;
     SmtpConn conn;
+    // 会话总限从连接前开始计：DNS/TCP/TLS/9 轮命令共享 120s，任何一环慢都不能无限拖
+    s_smtp_session_deadline = esp_timer_get_time() + SMTP_SESSION_MAX_US;
     idf_logf("连接SMTP服务器: %s:%d", server.c_str(), cfg.smtpPort);
     if (cfg.smtpPort == 465) {
         conn.implicitTls = esp_tls_init();
@@ -1091,6 +1122,7 @@ static bool send_smtp_email(const IdfEmailSettingsView& cfg, const std::string& 
     if (ok) smtp_command(conn, "QUIT", 221);
     else smtp_conn_write_all(conn, "QUIT\r\n");  // 失败路径不再等 QUIT 响应，避免死连接再吃 15s
     smtp_conn_close(conn);
+    s_smtp_session_deadline = 0;
     idf_log_line(ok ? "邮件发送完成" : "邮件发送失败");
     return ok;
 }
@@ -1357,9 +1389,11 @@ static bool pop_forward_job(ForwardJob& out)
     return found;
 }
 
-static void requeue_forward_later(ForwardJob& job, const char* reason)
+static void requeue_forward_later(ForwardJob& job, const char* reason, bool count_attempt = true)
 {
-    job.attempts++;
+    // 下游队列繁忙不算投递失败：真正的发送一次都没试过，
+    // 不该消耗重试预算——否则拥塞高峰期短信会被"零投递"地放弃
+    if (count_attempt) job.attempts++;
     if (job.attempts >= PUSH_RETRY_MAX) {
         idf_logf("%s，转发 id=%u 已重试%u次，保持未转发等待手动重发",
                  reason,
@@ -1476,7 +1510,7 @@ static bool process_forward_one()
         const char* reason = push_queue_busy && email_queue_busy ? "推送/邮件队列繁忙" :
                              (email_queue_busy ? "邮件队列繁忙" :
                               (push_queue_busy ? "推送队列繁忙" : "转发队列繁忙"));
-        requeue_forward_later(job, reason);
+        requeue_forward_later(job, reason, false);
         s_busy.store(false, std::memory_order_relaxed);
         return true;
     }

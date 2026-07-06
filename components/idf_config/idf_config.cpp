@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <ctype.h>
+#include <errno.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
@@ -249,6 +251,58 @@ static bool bool_from_text(const std::string& value)
     return value == "1" || value == "true" || value == "on" || value == "yes";
 }
 
+static bool parse_int_strict(const std::string& value, int& out)
+{
+    const char* start = value.c_str();
+    while (isspace(static_cast<unsigned char>(*start))) ++start;
+    if (*start == '\0') return false;
+    errno = 0;
+    char* end = nullptr;
+    long parsed = strtol(start, &end, 10);
+    if (end == start || errno == ERANGE || parsed < INT_MIN || parsed > INT_MAX) return false;
+    while (isspace(static_cast<unsigned char>(*end))) ++end;
+    if (*end != '\0') return false;
+    out = static_cast<int>(parsed);
+    return true;
+}
+
+static bool parse_u32_strict(const std::string& value, uint32_t& out)
+{
+    const char* p = value.c_str();
+    while (isspace(static_cast<unsigned char>(*p))) ++p;
+    if (!isdigit(static_cast<unsigned char>(*p))) return false;
+    uint64_t parsed = 0;
+    while (isdigit(static_cast<unsigned char>(*p))) {
+        parsed = parsed * 10ULL + static_cast<unsigned>(*p - '0');
+        if (parsed > 0xffffffffULL) return false;
+        ++p;
+    }
+    while (isspace(static_cast<unsigned char>(*p))) ++p;
+    if (*p != '\0') return false;
+    out = static_cast<uint32_t>(parsed);
+    return true;
+}
+
+static void import_int_field(int& target, const std::string& value)
+{
+    int parsed = 0;
+    if (parse_int_strict(value, parsed)) target = parsed;
+}
+
+static void import_u8_field(uint8_t& target, const std::string& value)
+{
+    int parsed = 0;
+    if (parse_int_strict(value, parsed) && parsed >= 0 && parsed <= 255) {
+        target = static_cast<uint8_t>(parsed);
+    }
+}
+
+static void import_u32_field(uint32_t& target, const std::string& value)
+{
+    uint32_t parsed = 0;
+    if (parse_u32_strict(value, parsed)) target = parsed;
+}
+
 static void append_kv(std::string& out, const char* key, const std::string& value)
 {
     out += key;
@@ -261,6 +315,13 @@ static void append_kv_i(std::string& out, const char* key, int value)
 {
     char buf[32];
     snprintf(buf, sizeof(buf), "%d", value);
+    append_kv(out, key, buf);
+}
+
+static void append_kv_u32(std::string& out, const char* key, uint32_t value)
+{
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%lu", static_cast<unsigned long>(value));
     append_kv(out, key, buf);
 }
 
@@ -425,7 +486,7 @@ std::string idf_config_export_text(void)
     append_kv(out, "kaTarget", c.kaTarget);
     append_kv(out, "kaUrl", c.kaUrl);
     append_kv(out, "kaProfile", c.kaProfile);
-    append_kv_i(out, "kaLastTime", static_cast<int>(c.kaLastTime));
+    append_kv_u32(out, "kaLastTime", c.kaLastTime);
 
     append_kv_i(out, "netLedEnabled", c.netLedEnabled ? 1 : 0);
     append_kv_i(out, "dataEnabled", c.dataEnabled ? 1 : 0);
@@ -472,7 +533,7 @@ std::string idf_config_export_text(void)
         snprintf(key, sizeof(key), "st%dPay", i);
         append_kv(out, key, t.payload);
         snprintf(key, sizeof(key), "st%dLast", i);
-        append_kv_i(out, key, static_cast<int>(t.lastRun));
+        append_kv_u32(out, key, t.lastRun);
     }
     return out;
 }
@@ -482,7 +543,7 @@ static void apply_import_key(IdfConfig& c, const std::string& key, const std::st
     if (key == "wifiSsid") c.wifiSsid = value;
     else if (key == "wifiPass") c.wifiPass = value;
     else if (key == "smtpServer") c.smtpServer = value;
-    else if (key == "smtpPort") c.smtpPort = std::max(1, atoi(value.c_str()));
+    else if (key == "smtpPort") import_int_field(c.smtpPort, value);
     else if (key == "smtpUser") c.smtpUser = value;
     else if (key == "smtpPass") c.smtpPass = value;
     else if (key == "smtpSendTo") c.smtpSendTo = value;
@@ -493,19 +554,19 @@ static void apply_import_key(IdfConfig& c, const std::string& key, const std::st
     else if (key == "fwdRules" || key == "forwardRules") c.forwardRules = value;
     else if (key == "emailEnabled") c.emailEnabled = bool_from_text(value);
     else if (key == "pushEnabled") c.pushEnabled = bool_from_text(value);
-    else if (key == "tzOffsetMin") c.tzOffsetMin = atoi(value.c_str());
+    else if (key == "tzOffsetMin") import_int_field(c.tzOffsetMin, value);
     else if (key == "ntpServer") c.ntpServer = value;
     else if (key == "rebootEnabled") c.rebootEnabled = bool_from_text(value);
-    else if (key == "rebootHour") c.rebootHour = atoi(value.c_str());
+    else if (key == "rebootHour") import_int_field(c.rebootHour, value);
     else if (key == "hbEnabled") c.hbEnabled = bool_from_text(value);
-    else if (key == "hbHour") c.hbHour = atoi(value.c_str());
+    else if (key == "hbHour") import_int_field(c.hbHour, value);
     else if (key == "kaEnabled") c.kaEnabled = bool_from_text(value);
-    else if (key == "kaIntervalDays") c.kaIntervalDays = atoi(value.c_str());
-    else if (key == "kaAction") c.kaAction = static_cast<uint8_t>(atoi(value.c_str()));
+    else if (key == "kaIntervalDays") import_int_field(c.kaIntervalDays, value);
+    else if (key == "kaAction") import_u8_field(c.kaAction, value);
     else if (key == "kaTarget") c.kaTarget = value;
     else if (key == "kaUrl") c.kaUrl = value.empty() ? IDF_KEEPALIVE_DEFAULT_URL : value;
     else if (key == "kaProfile") c.kaProfile = value;
-    else if (key == "kaLastTime") c.kaLastTime = static_cast<uint32_t>(strtoul(value.c_str(), nullptr, 10));
+    else if (key == "kaLastTime") import_u32_field(c.kaLastTime, value);
     else if (key == "netLedEnabled") c.netLedEnabled = bool_from_text(value);
     else if (key == "dataEnabled") c.dataEnabled = bool_from_text(value);
     else if (key == "apn") c.apn = value;
@@ -520,11 +581,11 @@ static void apply_import_key(IdfConfig& c, const std::string& key, const std::st
         else if (suffix == "Name") t.name = value;
         else if (suffix == "Prof") t.profile = value;
         else if (suffix == "Back") t.switchBack = bool_from_text(value);
-        else if (suffix == "Days") t.intervalDays = atoi(value.c_str());
-        else if (suffix == "Act") t.action = static_cast<uint8_t>(atoi(value.c_str()));
+        else if (suffix == "Days") import_int_field(t.intervalDays, value);
+        else if (suffix == "Act") import_u8_field(t.action, value);
         else if (suffix == "Tgt") t.target = value;
         else if (suffix == "Pay") t.payload = value;
-        else if (suffix == "Last") t.lastRun = static_cast<uint32_t>(strtoul(value.c_str(), nullptr, 10));
+        else if (suffix == "Last") import_u32_field(t.lastRun, value);
     }
     else if (key.rfind("push", 0) == 0) {
         size_t pos = 4;
@@ -539,7 +600,7 @@ static void apply_import_key(IdfConfig& c, const std::string& key, const std::st
         std::string suffix = key.substr(pos);
         IdfPushChannel& ch = c.pushChannels[idx];
         if (suffix == "en") ch.enabled = bool_from_text(value);
-        else if (suffix == "type") ch.type = static_cast<uint8_t>(atoi(value.c_str()));
+        else if (suffix == "type") import_u8_field(ch.type, value);
         else if (suffix == "url") ch.url = value;
         else if (suffix == "name") ch.name = value.empty() ? channel_default_name(idx) : value;
         else if (suffix == "k1") ch.key1 = value;
@@ -929,8 +990,11 @@ esp_err_t idf_config_save_time(int tz_offset_min, const std::string& ntp_server)
 
 esp_err_t idf_config_save_email(bool enabled, const std::string& server, int port,
                                 const std::string& user, const std::string& pass,
-                                const std::string& send_to)
+                                const std::string& send_to, bool preserve_blank_pass)
 {
+    esp_err_t mutex_err = ensure_config_mutex();
+    if (mutex_err != ESP_OK) return mutex_err;
+
     std::string next_server = trim_copy(server);
     std::string next_user = user;
     std::string next_pass = pass;
@@ -940,6 +1004,12 @@ esp_err_t idf_config_save_email(bool enabled, const std::string& server, int por
     limit_utf8_bytes(next_user, 128);
     limit_utf8_bytes(next_pass, 256);
     limit_utf8_bytes(next_send_to, 256);
+
+    if (preserve_blank_pass && is_blank(next_pass)) {
+        xSemaphoreTake(s_config_mutex, portMAX_DELAY);
+        next_pass = s_config.smtpPass;
+        xSemaphoreGive(s_config_mutex);
+    }
 
     nvs_handle_t nvs = 0;
     esp_err_t err = begin_field_save(&nvs);
@@ -1234,6 +1304,21 @@ IdfConfig idf_config_get(void)
     return config_snapshot();
 }
 
+static bool email_configured_locked()
+{
+    return !s_config.smtpServer.empty() && !s_config.smtpUser.empty() &&
+           !s_config.smtpPass.empty() && !s_config.smtpSendTo.empty();
+}
+
+static int enabled_push_count_locked()
+{
+    int count = 0;
+    for (const auto& ch : s_config.pushChannels) {
+        if (ch.enabled) ++count;
+    }
+    return count;
+}
+
 IdfConfigStatusView idf_config_get_status_view(void)
 {
     IdfConfigStatusView view;
@@ -1247,11 +1332,8 @@ IdfConfigStatusView idf_config_get_status_view(void)
     view.phoneNumber = s_config.phoneNumber;
     view.apn = s_config.apn;
     // 一次持锁取齐 /status 所需派生值：既省两次锁往返，也保证同一快照内自洽
-    view.emailConfigured = !s_config.smtpServer.empty() && !s_config.smtpUser.empty() &&
-                           !s_config.smtpPass.empty() && !s_config.smtpSendTo.empty();
-    for (const auto& ch : s_config.pushChannels) {
-        if (ch.enabled) ++view.pushEnabledCount;
-    }
+    view.emailConfigured = email_configured_locked();
+    view.pushEnabledCount = enabled_push_count_locked();
     xSemaphoreGive(s_config_mutex);
     return view;
 }
@@ -1285,12 +1367,11 @@ IdfConfigWebView idf_config_get_web_view(void)
     view.operatorPlmn = s_config.operatorPlmn;
     view.kaProfile = s_config.kaProfile;
     view.netLedEnabled = s_config.netLedEnabled;
-    view.emailConfigured = !s_config.smtpServer.empty() && !s_config.smtpUser.empty() &&
-                           !s_config.smtpPass.empty() && !s_config.smtpSendTo.empty();
+    view.emailConfigured = email_configured_locked();
     for (int i = 0; i < IDF_MAX_PUSH_CHANNELS; ++i) {
         view.pushChannels[i] = s_config.pushChannels[i];
-        if (s_config.pushChannels[i].enabled) ++view.pushEnabledCount;
     }
+    view.pushEnabledCount = enabled_push_count_locked();
     xSemaphoreGive(s_config_mutex);
     return view;
 }
@@ -1354,8 +1435,7 @@ IdfSchedRunView idf_config_get_sched_run_view(int index)
     view.kaUrl = s_config.kaUrl;
     view.tzOffsetMin = s_config.tzOffsetMin;
     view.emailEnabled = s_config.emailEnabled;
-    view.emailConfigured = !s_config.smtpServer.empty() && !s_config.smtpUser.empty() &&
-                           !s_config.smtpPass.empty() && !s_config.smtpSendTo.empty();
+    view.emailConfigured = email_configured_locked();
     view.dataEnabled = s_config.dataEnabled;
     view.apn = s_config.apn;
     xSemaphoreGive(s_config_mutex);
@@ -1384,12 +1464,6 @@ IdfSmsProcessView idf_config_get_sms_process_view(void)
     view.tzOffsetMin = s_config.tzOffsetMin;
     xSemaphoreGive(s_config_mutex);
     return view;
-}
-
-static bool email_configured_locked()
-{
-    return !s_config.smtpServer.empty() && !s_config.smtpUser.empty() &&
-           !s_config.smtpPass.empty() && !s_config.smtpSendTo.empty();
 }
 
 IdfPushForwardView idf_config_get_push_forward_view(void)
@@ -1508,8 +1582,7 @@ bool idf_config_email_configured(void)
 {
     if (ensure_config_mutex() != ESP_OK) return false;
     xSemaphoreTake(s_config_mutex, portMAX_DELAY);
-    bool ok = !s_config.smtpServer.empty() && !s_config.smtpUser.empty() &&
-              !s_config.smtpPass.empty() && !s_config.smtpSendTo.empty();
+    bool ok = email_configured_locked();
     xSemaphoreGive(s_config_mutex);
     return ok;
 }
@@ -1518,10 +1591,7 @@ int idf_config_enabled_push_count(void)
 {
     if (ensure_config_mutex() != ESP_OK) return 0;
     xSemaphoreTake(s_config_mutex, portMAX_DELAY);
-    int count = 0;
-    for (const auto& ch : s_config.pushChannels) {
-        if (ch.enabled) ++count;
-    }
+    int count = enabled_push_count_locked();
     xSemaphoreGive(s_config_mutex);
     return count;
 }

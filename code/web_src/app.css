@@ -317,6 +317,12 @@
       max-height: 60vh; min-height: 300px; overflow-y: auto;
       white-space: pre-wrap; word-break: break-all;
     }
+    .log-view-secondary {
+      background: #1e1e1e; color: #d4d4d4; padding: 12px; border-radius: var(--radius-sm);
+      font-family: var(--mono); font-size: 12px; line-height: 1.6;
+      max-height: 45vh; min-height: 80px; overflow-y: auto;
+      white-space: pre-wrap; word-break: break-all;
+    }
     .log-toolbar { display: flex; flex-wrap: wrap; gap: 7px; align-items: center; margin-top: 8px; }
     .log-toolbar .btn { flex: 0 0 auto; }
     .log-auto { margin-left: 4px; font-size: 13px; cursor: pointer; color: var(--body); }

@@ -20,6 +20,8 @@ powershell -ExecutionPolicy Bypass -File tools\idf.ps1 monitor -Port COM5
 
 The helper loads ESP-IDF 5.5.4, uses Ninja parallelism, and writes generated build files under `build/`.
 
+Minimum ESP-IDF: **v5.3+** — `components/idf_web` registers multi-method routes with `HTTP_ANY` (added to `esp_http_server` in v5.3); older IDF versions will fail to compile. Local helper and CI (`espressif/idf:release-v5.5`) both satisfy this.
+
 Before committing Web UI changes, run:
 
 ```powershell

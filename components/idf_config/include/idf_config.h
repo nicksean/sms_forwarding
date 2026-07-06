@@ -9,7 +9,7 @@
 #include "esp_err.h"
 
 static constexpr int IDF_MAX_PUSH_CHANNELS = 5;
-static constexpr const char* IDF_FW_VERSION = "1.0.5";
+static constexpr const char* IDF_FW_VERSION = "1.0.6";
 static constexpr const char* IDF_DEFAULT_WEB_USER = "admin";
 static constexpr const char* IDF_DEFAULT_WEB_PASS = "admin123";
 static constexpr const char* IDF_KEEPALIVE_DEFAULT_URL = "http://gg.incrafttime.top/api/payload?size=64342";
@@ -92,7 +92,7 @@ esp_err_t idf_config_save_account(const std::string& user, const std::string& pa
 esp_err_t idf_config_save_time(int tz_offset_min, const std::string& ntp_server);
 esp_err_t idf_config_save_email(bool enabled, const std::string& server, int port,
                                 const std::string& user, const std::string& pass,
-                                const std::string& send_to);
+                                const std::string& send_to, bool preserve_blank_pass);
 esp_err_t idf_config_save_push(bool enabled, const IdfPushChannel channels[IDF_MAX_PUSH_CHANNELS]);
 esp_err_t idf_config_save_filter(const std::string& admin_phone, const std::string& number_blacklist);
 esp_err_t idf_config_save_forward_rules(const std::string& rules);

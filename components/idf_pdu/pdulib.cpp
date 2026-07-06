@@ -396,6 +396,14 @@ int PDU::encodePDU(const char *recipient, const char *message, unsigned short cs
     udhsize = 0;
   else
     udhsize = buildUDH(csms, numparts, partnumber);
+  // 前置越界校验：头部(SCA+类型+号码+PID) + DCS/长度占位(2) + UDH + 正文
+  // (utf8_to_ucs2/utf8_to_packed7bit 最多写 MAX_NUMBER_OCTETS 字节，不感知
+  // smsOffset)。超长 SCA+号码+UDH 组合会溢出 170 字节栈缓冲，必须先拒绝。
+  if (smsOffset + 2 + udhsize + MAX_NUMBER_OCTETS > (int)sizeof(tempbuf))
+  {
+    overFlow = true;
+    return WORK_BUFFER_TOO_SMALL;
+  }
   int pduLengthPlaceHolder = 0;
   int septetcount = 0;
   switch (dcs)
@@ -690,10 +698,15 @@ int PDU::pduGsm7_to_unicode(const char *pdu, int numSeptets, char *unicode, char
   Decode a complete message
   returns true for success else false
 */
+extern bool SPstart;  // 定义在下方 ucs2_to_utf8 附近
+
 bool PDU::decodePDU(const char *pdu)
 {
   if (!pdu || !generalWorkBuff)
     return false;
+  // 代理对状态是文件级全局：上一条畸形 UCS2 短信(以孤立高位代理结尾)会把
+  // SPstart 遗留为 true，吞掉下一条短信的首字符。每条消息解码前复位。
+  SPstart = false;
   bool rc = true;
   int index = 0;
   int outindex = 0;

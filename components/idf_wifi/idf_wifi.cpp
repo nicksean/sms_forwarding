@@ -53,6 +53,9 @@ static std::atomic<bool> s_button_task_started{false};
 static std::atomic<bool> s_sntp_started{false};
 static std::atomic<bool> s_sta_connected{false};
 static std::atomic<int> s_disconnect_streak{0};
+static std::atomic<int64_t> s_last_beacon_log_us{0};
+static std::atomic<uint32_t> s_suppressed_beacon_logs{0};
+static std::atomic<bool> s_suppress_next_connect_log{false};
 static esp_timer_handle_t s_reconnect_timer = nullptr;
 static char s_ntp_server[128] = "ntp.aliyun.com";
 
@@ -199,6 +202,77 @@ static std::string mac_to_string(const uint8_t mac[6])
     return std::string(buf);
 }
 
+static const char* wifi_disconnect_reason_name(uint8_t reason)
+{
+    switch (reason) {
+        case WIFI_REASON_UNSPECIFIED: return "未指定";
+        case WIFI_REASON_AUTH_EXPIRE: return "认证过期";
+        case WIFI_REASON_AUTH_LEAVE: return "认证离开";
+        case WIFI_REASON_DISASSOC_DUE_TO_INACTIVITY: return "空闲断开";
+        case WIFI_REASON_ASSOC_TOOMANY: return "AP连接数满";
+        case WIFI_REASON_ASSOC_LEAVE: return "关联离开";
+        case WIFI_REASON_ASSOC_NOT_AUTHED: return "关联未认证";
+        case WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT: return "四次握手超时";
+        case WIFI_REASON_GROUP_KEY_UPDATE_TIMEOUT: return "组密钥更新超时";
+        case WIFI_REASON_IE_IN_4WAY_DIFFERS: return "四次握手IE不匹配";
+        case WIFI_REASON_802_1X_AUTH_FAILED: return "802.1X认证失败";
+        case WIFI_REASON_TIMEOUT: return "链路超时";
+        case WIFI_REASON_PEER_INITIATED: return "对端主动断开";
+        case WIFI_REASON_AP_INITIATED: return "AP主动断开";
+        case WIFI_REASON_BEACON_TIMEOUT: return "Beacon超时";
+        case WIFI_REASON_NO_AP_FOUND: return "未找到AP";
+        case WIFI_REASON_AUTH_FAIL: return "认证失败";
+        case WIFI_REASON_ASSOC_FAIL: return "关联失败";
+        case WIFI_REASON_HANDSHAKE_TIMEOUT: return "握手超时";
+        case WIFI_REASON_CONNECTION_FAIL: return "连接失败";
+        case WIFI_REASON_AP_TSF_RESET: return "AP时钟重置";
+        case WIFI_REASON_ROAMING: return "漫游切换";
+        case WIFI_REASON_ASSOC_COMEBACK_TIME_TOO_LONG: return "关联等待过长";
+        case WIFI_REASON_SA_QUERY_TIMEOUT: return "SA查询超时";
+        case WIFI_REASON_NO_AP_FOUND_W_COMPATIBLE_SECURITY: return "未找到兼容安全AP";
+        case WIFI_REASON_NO_AP_FOUND_IN_AUTHMODE_THRESHOLD: return "认证方式不匹配";
+        case WIFI_REASON_NO_AP_FOUND_IN_RSSI_THRESHOLD: return "信号低于阈值";
+        default: return "未知原因";
+    }
+}
+
+static void log_wifi_disconnect_once(uint8_t reason, int8_t rssi)
+{
+    static constexpr int64_t BEACON_LOG_INTERVAL_US = 5LL * 60LL * 1000000LL;
+    bool beacon_timeout = reason == WIFI_REASON_BEACON_TIMEOUT;
+    int64_t now_us = esp_timer_get_time();
+    uint32_t suppressed = 0;
+
+    if (beacon_timeout) {
+        int64_t last_us = s_last_beacon_log_us.load(std::memory_order_relaxed);
+        if (last_us > 0 && now_us - last_us < BEACON_LOG_INTERVAL_US) {
+            s_suppressed_beacon_logs.fetch_add(1, std::memory_order_relaxed);
+            s_suppress_next_connect_log.store(true, std::memory_order_relaxed);
+            return;
+        }
+        s_last_beacon_log_us.store(now_us, std::memory_order_relaxed);
+        suppressed = s_suppressed_beacon_logs.exchange(0, std::memory_order_relaxed);
+    } else {
+        suppressed = s_suppressed_beacon_logs.exchange(0, std::memory_order_relaxed);
+    }
+
+    char rssi_text[24] = {};
+    if (rssi < 0) {
+        snprintf(rssi_text, sizeof(rssi_text), "%d dBm", static_cast<int>(rssi));
+    } else {
+        snprintf(rssi_text, sizeof(rssi_text), "未知");
+    }
+    const char* reason_name = wifi_disconnect_reason_name(reason);
+    char tail[80] = {};
+    if (suppressed) {
+        snprintf(tail, sizeof(tail), "，此前 Beacon 瞬断%lu次已合并",
+                 static_cast<unsigned long>(suppressed));
+    }
+    idf_logf("WiFi 断开: %s(%u)，RSSI=%s，自动重连%s",
+             reason_name, static_cast<unsigned>(reason), rssi_text, tail);
+    s_suppress_next_connect_log.store(false, std::memory_order_relaxed);
+}
+
 static void wifi_event_handler(void*, esp_event_base_t event_base, int32_t event_id, void* event_data)
 {
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
@@ -207,14 +281,17 @@ static void wifi_event_handler(void*, esp_event_base_t event_base, int32_t event
     }
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
         s_sta_connected.store(false, std::memory_order_relaxed);
-        if (s_wifi_event_group) xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
+        if (s_wifi_event_group) {
+            xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+            xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
+        }
         // 前几次断开立即重连(快速恢复瞬断)；持续失败后退避，交给 15s 看门狗定时器，
         // 避免错误密码/信号差时无间隔连接风暴打断配网 AP 和 WiFi 扫描
         int streak = s_disconnect_streak.fetch_add(1, std::memory_order_relaxed) + 1;
         if (streak == 1 && event_data) {
-            // 只在断开链的第一次记 Web 日志：原因码用于区分路由器踢/信号差/漫游
+            // 只在断开链的第一次记 Web 日志；频繁 Beacon 瞬断合并，避免日志页刷屏。
             auto* ev = static_cast<wifi_event_sta_disconnected_t*>(event_data);
-            idf_logf("WiFi 断开(原因码 %d)，自动重连", static_cast<int>(ev->reason));
+            log_wifi_disconnect_once(ev->reason, ev->rssi);
         }
         if (streak <= 3 && sta_can_connect()) {
             esp_wifi_connect();
@@ -229,9 +306,14 @@ static void wifi_event_handler(void*, esp_event_base_t event_base, int32_t event
         s_sta_connected.store(true, std::memory_order_relaxed);
         s_disconnect_streak.store(0, std::memory_order_relaxed);
         ESP_LOGI(TAG, "STA 已获取 IP: " IPSTR, IP2STR(&event->ip_info.ip));
-        idf_logf("WiFi 已连接，IP=" IPSTR, IP2STR(&event->ip_info.ip));
+        if (!s_suppress_next_connect_log.exchange(false, std::memory_order_relaxed)) {
+            idf_logf("WiFi 已连接，IP=" IPSTR, IP2STR(&event->ip_info.ip));
+        }
         start_sntp_once();
-        if (s_wifi_event_group) xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+        if (s_wifi_event_group) {
+            xEventGroupClearBits(s_wifi_event_group, WIFI_FAIL_BIT);
+            xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+        }
         ApState ap = ap_state_snapshot();
         if (ap.mode && !ap.manual && s_has_sta_credentials.load(std::memory_order_relaxed)) {
             if (esp_wifi_set_mode(WIFI_MODE_STA) == ESP_OK) {
@@ -290,6 +372,9 @@ static void dns_captive_task(void*)
         sockaddr_in from = {};
         socklen_t from_len = sizeof(from);
         int len = recvfrom(sock, req, sizeof(req), 0, reinterpret_cast<sockaddr*>(&from), &from_len);
+        // 立即报错(非超时，如 lwIP 缺内存返回 ENOMEM)时必须让出 CPU：
+        // 节奏本来全靠 1s 接收超时，错误直返会变成高优先级忙等，饿死空闲任务
+        if (len < 0 && errno != EWOULDBLOCK && errno != EAGAIN) vTaskDelay(pdMS_TO_TICKS(200));
         if (!ap_state_snapshot().mode) {
             // 配网结束后释放 53 端口和任务(recv 超时 1s，约 10s 后自退出；再次配网会重建)
             if (++ap_off_seconds >= 10) break;
@@ -416,6 +501,8 @@ static void mdns_sms_task(void*)
         sockaddr_in from = {};
         socklen_t from_len = sizeof(from);
         int len = recvfrom(sock, req, sizeof(req), 0, reinterpret_cast<sockaddr*>(&from), &from_len);
+        // 同配网 DNS：立即报错时让出 CPU，防止 lwIP 内存紧张期高优先级忙等
+        if (len < 0 && errno != EWOULDBLOCK && errno != EAGAIN) vTaskDelay(pdMS_TO_TICKS(200));
         if (!joined && ++retry_countdown >= 15) {  // recv 超时 1s，约每 15s 重试加组
             retry_countdown = 0;
             joined = join_group();

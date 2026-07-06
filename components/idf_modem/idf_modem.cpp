@@ -1,6 +1,7 @@
 #include "idf_modem.h"
 
 #include <ctype.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -12,6 +13,7 @@
 #include "driver/uart.h"
 #include "esp_log.h"
 #include "esp_random.h"
+#include "esp_system.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
@@ -36,9 +38,8 @@ static constexpr uint32_t CELLULAR_HTTP_TIMEOUT_MS = 90000UL;
 static constexpr uint32_t CELLULAR_PDP_READY_TIMEOUT_MS = 12000UL;
 static constexpr uint32_t MODEM_DATA_MODE_RETRY_GAP_MS = 10000UL;
 static constexpr uint8_t MODEM_DATA_MODE_RETRY_MAX = 3;
-static constexpr uint32_t SIGNAL_DETAIL_INTERVAL_MS = 120000UL;
 static constexpr uint32_t IDENTITY_RETRY_INTERVAL_MS = 600000UL;
-// 概览页打开(在轮询 /status)期间的提频采样间隔：网页显示与真实信号更贴近；
+// 用户显式刷新概览模组信息后才做展示型采样：启动期不主动读取身份/信号；
 // 采样仍受 at_channel_idle 门控，不与收发/保号抢 AT 通道
 static constexpr uint32_t SIGNAL_INTERVAL_WEB_MS = 10000UL;
 static constexpr uint32_t SIGNAL_DETAIL_INTERVAL_WEB_MS = 30000UL;
@@ -68,6 +69,7 @@ static bool s_logged_detail_valid = false;
 static bool s_identity_static_attempted = false;
 static bool s_identity_network_attempted = false;
 static std::atomic<int64_t> s_last_web_poll_us{-WEB_POLL_ACTIVE_WINDOW_US};
+static std::atomic<uint32_t> s_status_sample_requests{0};
 
 void idf_modem_signal_event(void);
 
@@ -99,6 +101,37 @@ static std::string trim(std::string value)
     size_t end = value.size();
     while (end > start && isspace(static_cast<unsigned char>(value[end - 1]))) --end;
     return value.substr(start, end - start);
+}
+
+static bool parse_long_token(const std::string& value, long& out)
+{
+    std::string text = trim(value);
+    if (text.empty()) return false;
+    errno = 0;
+    char* end = nullptr;
+    long parsed = strtol(text.c_str(), &end, 10);
+    if (end == text.c_str() || errno == ERANGE) return false;
+    while (*end && isspace(static_cast<unsigned char>(*end))) ++end;
+    if (*end != '\0') return false;
+    out = parsed;
+    return true;
+}
+
+static bool parse_comma_longs(const std::string& text, long* values, int max_values, int& count)
+{
+    count = 0;
+    size_t start = 0;
+    while (start < text.size() && count < max_values) {
+        size_t comma = text.find(',', start);
+        std::string part = text.substr(start, comma == std::string::npos ? std::string::npos : comma - start);
+        part = trim(part);
+        long value = 0;
+        if (part.empty() || !parse_long_token(part, value)) return false;
+        values[count++] = value;
+        if (comma == std::string::npos) break;
+        start = comma + 1;
+    }
+    return count > 0;
 }
 
 // tick 回绕安全的超时窗口：`now + timeout` 在 49.7 天(1000Hz tick)回绕时会溢出，
@@ -158,7 +191,7 @@ static std::string first_payload_line(const std::string& resp, const char* cmd =
     return {};
 }
 
-static std::string first_digits_line(const std::string& resp)
+static std::string first_digits_line(const std::string& resp, size_t min_len, size_t max_len)
 {
     size_t pos = 0;
     while (pos < resp.size()) {
@@ -167,7 +200,7 @@ static std::string first_digits_line(const std::string& resp)
         std::string line = trim(resp.substr(pos, end - pos));
         bool digits = !line.empty();
         for (char ch : line) digits = digits && isdigit(static_cast<unsigned char>(ch));
-        if (digits) return line;
+        if (digits && line.size() >= min_len && line.size() <= max_len) return line;
         pos = end + 1;
     }
     return {};
@@ -189,6 +222,45 @@ static std::string first_digit_run(const std::string& resp, size_t min_len, size
     return {};
 }
 
+static bool is_iccid_text(const std::string& value)
+{
+    if (value.size() < 15 || value.size() > 22) return false;
+    bool seen_digit = false;
+    bool padding = false;
+    uint8_t padding_count = 0;
+    for (char ch : value) {
+        if (isdigit(static_cast<unsigned char>(ch))) {
+            if (padding) return false;
+            seen_digit = true;
+        } else if (ch == 'F' || ch == 'f') {
+            if (!seen_digit) return false;
+            padding = true;
+            if (++padding_count > 1) return false;
+        } else {
+            return false;
+        }
+    }
+    return seen_digit;
+}
+
+static bool is_imei_text(const std::string& value)
+{
+    if (value.size() < 14 || value.size() > 17) return false;
+    for (char ch : value) {
+        if (!isdigit(static_cast<unsigned char>(ch))) return false;
+    }
+    return true;
+}
+
+static bool is_imsi_text(const std::string& value)
+{
+    if (value.size() < 14 || value.size() > 16) return false;
+    for (char ch : value) {
+        if (!isdigit(static_cast<unsigned char>(ch))) return false;
+    }
+    return true;
+}
+
 static std::string first_quoted(const std::string& line, size_t start = 0)
 {
     size_t q1 = line.find('"', start);
@@ -202,6 +274,16 @@ static void set_phase(const char* phase)
 {
     if (xSemaphoreTake(s_status_mutex, pdMS_TO_TICKS(200)) == pdTRUE) {
         s_status.phase = phase;
+        if (strcmp(phase, "powering") == 0 || strcmp(phase, "failed") == 0) {
+            s_status.atReady = false;
+            s_status.modemReady = false;
+        } else if (strcmp(phase, "at_ready") == 0 || strcmp(phase, "registering") == 0) {
+            s_status.atReady = true;
+            s_status.modemReady = false;
+        } else if (strcmp(phase, "ready") == 0) {
+            s_status.atReady = true;
+            s_status.modemReady = true;
+        }
         xSemaphoreGive(s_status_mutex);
     }
 }
@@ -231,16 +313,16 @@ static void update_status(const IdfModemStatus& patch, bool identity = false, bo
     if (carries_registration) s_status.modemReady = patch.modemReady;
     if (patch.ceregStat >= 0) s_status.ceregStat = patch.ceregStat;
     if (patch.csq >= 0) s_status.csq = patch.csq;
-    if (patch.ber != 99) s_status.ber = patch.ber;
+    if (patch.csq >= 0 || patch.ber != 99) s_status.ber = patch.ber;
     if (patch.rsrp != 999) s_status.rsrp = patch.rsrp;
     if (patch.rsrq != 999) s_status.rsrq = patch.rsrq;
     if (patch.sinr != 999) s_status.sinr = patch.sinr;
     if (!patch.mfr.empty()) s_status.mfr = patch.mfr;
     if (!patch.model.empty()) s_status.model = patch.model;
     if (!patch.fwver.empty()) s_status.fwver = patch.fwver;
-    if (!patch.imei.empty()) s_status.imei = patch.imei;
-    if (!patch.iccid.empty()) s_status.iccid = patch.iccid;
-    if (!patch.imsi.empty()) s_status.imsi = patch.imsi;
+    if (!patch.imei.empty() && is_imei_text(patch.imei)) s_status.imei = patch.imei;
+    if (!patch.iccid.empty() && is_iccid_text(patch.iccid)) s_status.iccid = patch.iccid;
+    if (!patch.imsi.empty() && is_imsi_text(patch.imsi)) s_status.imsi = patch.imsi;
     if (!patch.operatorName.empty()) s_status.operatorName = patch.operatorName;
     if (!patch.apnSim.empty()) s_status.apnSim = patch.apnSim;
     if (!patch.cellIp.empty()) s_status.cellIp = patch.cellIp;
@@ -250,13 +332,20 @@ static void update_status(const IdfModemStatus& patch, bool identity = false, bo
     xSemaphoreGive(s_status_mutex);
 }
 
-static bool identity_complete(void)
+static bool startup_info_complete(void)
 {
     bool complete = false;
     if (xSemaphoreTake(s_status_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-        complete = s_status.imei.size() >= 14 &&
-                   s_status.iccid.size() >= 15 &&
-                   !s_status.imsi.empty();
+        complete = s_status.signalFresh &&
+                   s_status.identityFresh &&
+                   !s_status.mfr.empty() &&
+                   !s_status.model.empty() &&
+                   !s_status.fwver.empty() &&
+                   is_imei_text(s_status.imei) &&
+                   is_iccid_text(s_status.iccid) &&
+                   is_imsi_text(s_status.imsi) &&
+                   !s_status.operatorName.empty() &&
+                   s_identity_network_attempted;
         xSemaphoreGive(s_status_mutex);
     }
     return complete;
@@ -287,33 +376,22 @@ static std::string read_nvs_string(nvs_handle_t nvs, const char* key, size_t max
     return value;
 }
 
-static void load_identity_cache()
-{
-    nvs_handle_t nvs = 0;
-    if (nvs_open("sms_config", NVS_READONLY, &nvs) != ESP_OK) return;
-    IdfModemStatus patch;
-    patch.imei = read_nvs_string(nvs, "modemImei", 32);
-    patch.iccid = read_nvs_string(nvs, "modemIccid", 32);
-    nvs_close(nvs);
-    if (!patch.imei.empty() || !patch.iccid.empty()) {
-        update_status(patch);
-    }
-}
-
 static void save_identity_cache(const std::string& imei, const std::string& iccid)
 {
-    if (imei.size() < 14 && iccid.size() < 15) return;
+    bool valid_imei = is_imei_text(imei);
+    bool valid_iccid = is_iccid_text(iccid);
+    if (!valid_imei && !valid_iccid) return;
     nvs_handle_t nvs = 0;
     if (nvs_open("sms_config", NVS_READWRITE, &nvs) != ESP_OK) return;
     std::string old_imei = read_nvs_string(nvs, "modemImei", 32);
     std::string old_iccid = read_nvs_string(nvs, "modemIccid", 32);
     esp_err_t err = ESP_OK;
     bool changed = false;
-    if (imei.size() >= 14 && imei != old_imei) {
+    if (valid_imei && imei != old_imei) {
         err = nvs_set_str(nvs, "modemImei", imei.c_str());
         changed = err == ESP_OK;
     }
-    if (err == ESP_OK && iccid.size() >= 15 && iccid != old_iccid) {
+    if (err == ESP_OK && valid_iccid && iccid != old_iccid) {
         err = nvs_set_str(nvs, "modemIccid", iccid.c_str());
         changed = changed || err == ESP_OK;
     }
@@ -346,6 +424,8 @@ static void append_urc_text(const std::string& text)
     idf_modem_signal_event();  // 立即唤醒短信任务处理，不等它的轮询周期
 }
 
+static void append_capped(std::string& out, const uint8_t* data, size_t len, size_t cap);
+
 static void capture_pending_uart_locked(uint32_t max_ms)
 {
     // RX 缓冲为空时立即返回：该函数在每条 AT 命令前都会执行，
@@ -356,14 +436,19 @@ static void capture_pending_uart_locked(uint32_t max_ms)
     std::string pending;
     pending.reserve(256);
     uint8_t buf[128];
-    TickDeadline deadline(max_ms);
+    // 静默窗口(有数据就续期)之上必须再加总时长硬上限：模组连续吐数据
+    // (下载中途中止的 MHTTP 载荷、复位横幅、错误波特率乱码)时，纯续期
+    // 循环永不退出，pending 无限增长直至堆耗尽。URC 缓冲本身只留 4KB 尾部，
+    // 这里同样只保留尾部即可，多攒毫无意义。
+    TickDeadline hard_deadline(std::max<uint32_t>(max_ms, 1000));
+    TickDeadline quiet(max_ms);
     do {
         int got = uart_read_bytes(MODEM_UART, buf, sizeof(buf), pdMS_TO_TICKS(20));
         if (got > 0) {
-            pending.append(reinterpret_cast<const char*>(buf), got);
-            deadline.restart(40);
+            append_capped(pending, buf, static_cast<size_t>(got), URC_BUFFER_MAX);
+            quiet.restart(40);
         }
-    } while (!deadline.expired());
+    } while (!quiet.expired() && !hard_deadline.expired());
     if (!pending.empty()) append_urc_text(pending);
 }
 
@@ -515,9 +600,14 @@ esp_err_t idf_modem_send_pdu(const std::string& cmgs_cmd, const char* pdu, uint3
     }
 
     if (got_prompt) {
-        uart_write_bytes(MODEM_UART, pdu, strlen(pdu));
-        const uint8_t end = 0x1A;  // Ctrl+Z 提交 PDU，ML307R/Arduino 版同样要求
-        uart_write_bytes(MODEM_UART, &end, 1);
+        size_t pdu_len = strlen(pdu);
+        uart_write_bytes(MODEM_UART, pdu, pdu_len);
+        // Ctrl+Z 提交 PDU；encodePDU 生成的缓冲已自带 0x1A 结尾，
+        // 避免重复发送在命令模式下多注入一个孤立控制字符
+        if (pdu_len == 0 || static_cast<uint8_t>(pdu[pdu_len - 1]) != 0x1A) {
+            const uint8_t end = 0x1A;
+            uart_write_bytes(MODEM_UART, &end, 1);
+        }
         TickDeadline deadline(timeout_ms);
         scan.clear();
         while (!deadline.expired()) {
@@ -555,14 +645,17 @@ static bool parse_csq(const std::string& resp, int& csq, int& ber)
 {
     size_t p = resp.find("+CSQ:");
     if (p == std::string::npos) return false;
-    int a = -1;
-    int b = 99;
-    if (sscanf(resp.c_str() + p, "+CSQ: %d,%d", &a, &b) == 2) {
-        csq = a;
-        ber = b;
-        return true;
-    }
-    return false;
+    std::string line = line_containing(resp, p);
+    const char* token = strstr(line.c_str(), "+CSQ:");
+    if (!token) return false;
+    long values[2] = {};
+    int count = 0;
+    if (!parse_comma_longs(token + strlen("+CSQ:"), values, 2, count) || count < 2) return false;
+    if (!((values[0] >= 0 && values[0] <= 31) || values[0] == 99)) return false;
+    if (!((values[1] >= 0 && values[1] <= 7) || values[1] == 99)) return false;
+    csq = static_cast<int>(values[0]);
+    ber = static_cast<int>(values[1]);
+    return true;
 }
 
 static const char* format_ber(int ber, char* buf, size_t len)
@@ -576,17 +669,28 @@ static bool parse_cereg(const std::string& resp, int& stat)
 {
     size_t p = resp.find("+CEREG:");
     if (p == std::string::npos) return false;
-    int n = 0;
-    int s = -1;
-    if (sscanf(resp.c_str() + p, "+CEREG: %d,%d", &n, &s) == 2) {
-        stat = s;
-        return true;
+    std::string line = line_containing(resp, p);
+    const char* token = strstr(line.c_str(), "+CEREG:");
+    if (!token) return false;
+    std::string rest = token + strlen("+CEREG:");
+    size_t comma = rest.find(',');
+    std::string first = trim(rest.substr(0, comma));
+    long first_value = -1;
+    if (!parse_long_token(first, first_value)) return false;
+
+    long status_value = first_value;
+    if (comma != std::string::npos) {
+        size_t second_end = rest.find(',', comma + 1);
+        std::string second = trim(rest.substr(
+            comma + 1, second_end == std::string::npos ? std::string::npos : second_end - comma - 1));
+        long second_value = -1;
+        // 查询响应是 +CEREG: <n>,<stat>；URC 是 +CEREG: <stat>[,<tac>,...]，
+        // 后者第二字段通常是带引号的 TAC，不能把它当注册状态。
+        if (parse_long_token(second, second_value)) status_value = second_value;
     }
-    if (sscanf(resp.c_str() + p, "+CEREG: %d", &s) == 1) {
-        stat = s;
-        return true;
-    }
-    return false;
+    if (status_value < 0 || status_value > 5) return false;
+    stat = static_cast<int>(status_value);
+    return true;
 }
 
 // 注意：都要解析"包含 token 的那一行"。CEREG=2 的 URC 可能与查询响应混在同一段，
@@ -749,8 +853,11 @@ static esp_err_t send_at_locked(const std::string& cmd, uint32_t timeout_ms,
             int final_code = at_final_result(response);
             if (final_code != 0) {
                 ret = final_code > 0 ? ESP_OK : ESP_FAIL;
+                // 静默续期之上加总时长硬上限：URC 持续刷屏(如下载进度)时
+                // 纯续期循环会无限占住 AT 通道锁，拖死所有 AT 使用方
+                TickDeadline extra_hard(extra_read_ms * 4 + 200);
                 TickDeadline extra_deadline(extra_read_ms);
-                while (!extra_deadline.expired()) {
+                while (!extra_deadline.expired() && !extra_hard.expired()) {
                     int more = uart_read_bytes(MODEM_UART, buf, sizeof(buf), pdMS_TO_TICKS(15));
                     if (more <= 0) continue;
                     room = max_capture > response.size() ? max_capture - response.size() : 0;
@@ -770,26 +877,13 @@ static int parse_mhttp_create_id(const std::string& resp)
     size_t p = resp.find("+MHTTPCREATE:");
     if (p == std::string::npos) return -1;
     p += strlen("+MHTTPCREATE:");
-    while (p < resp.size() && !isdigit(static_cast<unsigned char>(resp[p])) && resp[p] != '-') ++p;
-    if (p >= resp.size()) return -1;
-    return static_cast<int>(strtol(resp.c_str() + p, nullptr, 10));
-}
-
-static bool parse_comma_longs(const std::string& text, long* values, int max_values, int& count)
-{
-    count = 0;
-    size_t start = 0;
-    while (start < text.size() && count < max_values) {
-        size_t comma = text.find(',', start);
-        std::string part = text.substr(start, comma == std::string::npos ? std::string::npos : comma - start);
-        part = trim(part);
-        if (!part.empty() && (isdigit(static_cast<unsigned char>(part[0])) || part[0] == '-')) {
-            values[count++] = strtol(part.c_str(), nullptr, 10);
-        }
-        if (comma == std::string::npos) break;
-        start = comma + 1;
-    }
-    return count > 0;
+    size_t end = resp.find_first_of("\r\n", p);
+    std::string token = resp.substr(p, end == std::string::npos ? std::string::npos : end - p);
+    size_t comma = token.find(',');
+    if (comma != std::string::npos) token.resize(comma);
+    long id = -1;
+    if (!parse_long_token(token, id) || id < 0 || id > 255) return -1;
+    return static_cast<int>(id);
 }
 
 static void parse_mhttp_head(const std::string& head, int http_id, IdfCellularHttpResult& result,
@@ -910,6 +1004,27 @@ static bool wait_mhttp_download_locked(int http_id, uint32_t timeout_ms, IdfCell
            result.bytesRead >= CELLULAR_KEEPALIVE_MIN_BYTES;
 }
 
+static bool valid_ipv4_address(const std::string& value)
+{
+    int parts = 0;
+    size_t pos = 0;
+    bool non_zero = false;
+    while (pos <= value.size() && parts < 4) {
+        size_t dot = value.find('.', pos);
+        std::string part = value.substr(pos, dot == std::string::npos ? std::string::npos : dot - pos);
+        if (part.empty() || part.size() > 3) return false;
+        if (part.size() > 1 && part[0] == '0') return false;
+        long octet = -1;
+        if (!parse_long_token(part, octet) || octet < 0 || octet > 255) return false;
+        if (octet != 0) non_zero = true;
+        ++parts;
+        if (dot == std::string::npos) break;
+        if (parts >= 4) return false;
+        pos = dot + 1;
+    }
+    return parts == 4 && non_zero;
+}
+
 static bool parse_cgpaddr_ip(const std::string& resp, std::string& ip)
 {
     size_t p = resp.find("+CGPADDR:");
@@ -920,7 +1035,7 @@ static bool parse_cgpaddr_ip(const std::string& resp, std::string& ip)
     if (comma == std::string::npos || comma >= eol) return false;
     ip = trim(resp.substr(comma + 1, eol - comma - 1));
     ip.erase(std::remove(ip.begin(), ip.end(), '"'), ip.end());
-    if (ip.size() < 7 || ip == "0.0.0.0") return false;
+    if (!valid_ipv4_address(ip)) return false;
     return true;
 }
 
@@ -983,22 +1098,22 @@ static bool parse_muestats_cell(const std::string& resp, IdfModemStatus& patch)
 
     bool got = false;
     if (!parts[7].empty()) {
-        long value = strtol(parts[7].c_str(), nullptr, 10);
-        if (value > -32768) {
+        long value = 0;
+        if (parse_long_token(parts[7], value) && value > -32768) {
             patch.rsrp = static_cast<int>(value / 10);
             got = true;
         }
     }
     if (!parts[8].empty()) {
-        long value = strtol(parts[8].c_str(), nullptr, 10);
-        if (value > -32768) {
+        long value = 0;
+        if (parse_long_token(parts[8], value) && value > -32768) {
             patch.rsrq = static_cast<int>(value / 10);
             got = true;
         }
     }
     if (!parts[10].empty()) {
-        long value = strtol(parts[10].c_str(), nullptr, 10);
-        if (value > -32768) {
+        long value = 0;
+        if (parse_long_token(parts[10], value) && value > -32768) {
             patch.sinr = static_cast<int>(value / 10);
             got = true;
         }
@@ -1011,14 +1126,12 @@ static bool parse_cesq_signal(const std::string& resp, IdfModemStatus& patch)
     size_t p = resp.find("+CESQ:");
     if (p == std::string::npos) return false;
     long values[6] = {};
-    const char* s = resp.c_str() + p + strlen("+CESQ:");
-    char* end = nullptr;
-    for (int i = 0; i < 6; ++i) {
-        while (*s == ' ' || *s == ',') ++s;
-        values[i] = strtol(s, &end, 10);
-        if (end == s) return false;
-        s = end;
-    }
+    int count = 0;
+    size_t value_start = p + strlen("+CESQ:");
+    size_t line_end = resp.find_first_of("\r\n", value_start);
+    std::string line = resp.substr(
+        value_start, line_end == std::string::npos ? std::string::npos : line_end - value_start);
+    if (!parse_comma_longs(line, values, 6, count) || count < 6) return false;
     bool got = false;
     if (values[4] >= 0 && values[4] <= 34) {
         patch.rsrq = static_cast<int>(values[4] / 2 - 20);
@@ -1297,10 +1410,10 @@ esp_err_t idf_modem_cellular_http_get(const std::string& url, const IdfCellularH
     std::string ip;
     bool pdp_ready = wait_pdp_ready_locked(CELLULAR_PDP_READY_TIMEOUT_MS, ip);
     if (!pdp_ready) {
+        set_status_cell_ip("");
         if (!config.dataEnabled) {
             idf_log_line("关闭PDP上下文(CGACT=0)...");
             send_at_locked("AT+CGACT=0,1", 5000, resp);
-            set_status_cell_ip("");
         }
         xSemaphoreGive(s_at_mutex);
         result.message = "蜂窝PDP未取得有效IP，请查看日志";
@@ -1357,20 +1470,23 @@ static void sample_signal_once(void)
 static bool sample_identity_once(bool log_summary = false, bool include_network_fields = true)
 {
     IdfModemStatus before = idf_modem_get_status();
-    bool first_static_attempt = !s_identity_static_attempted;
+    bool need_static = !s_identity_static_attempted ||
+                       before.mfr.empty() ||
+                       before.model.empty() ||
+                       before.fwver.empty();
     std::string resp;
     IdfModemStatus patch;
 
-    // 固件/厂家信息基本不变，只在本轮模组启动后尝试一次；失败不触发长期重试。
-    if (first_static_attempt && before.mfr.empty()) {
+    // 固件/厂家信息基本不变；启动采样未完整前允许补采，完整后不再反复查询。
+    if (need_static && before.mfr.empty()) {
         if (send_ok("AT+CGMI", 1000, &resp)) patch.mfr = first_payload_line(resp, "AT+CGMI");
         vTaskDelay(pdMS_TO_TICKS(150));
     }
-    if (first_static_attempt && before.model.empty()) {
+    if (need_static && before.model.empty()) {
         if (send_ok("AT+CGMM", 1000, &resp)) patch.model = first_payload_line(resp, "AT+CGMM");
         vTaskDelay(pdMS_TO_TICKS(150));
     }
-    if (first_static_attempt && before.fwver.empty()) {
+    if (need_static && before.fwver.empty()) {
         if (send_ok("AT+CGMR", 1000, &resp)) patch.fwver = first_payload_line(resp, "AT+CGMR");
         vTaskDelay(pdMS_TO_TICKS(150));
     }
@@ -1380,7 +1496,7 @@ static bool sample_identity_once(bool log_summary = false, bool include_network_
         for (const char* cmd : imei_cmds) {
             if (!patch.imei.empty()) break;
             if (send_ok(cmd, 1000, &resp)) {
-                patch.imei = first_digits_line(resp);
+                patch.imei = first_digits_line(resp, 14, 17);
                 if (patch.imei.empty()) patch.imei = first_digit_run(resp, 14, 17);
             }
             vTaskDelay(pdMS_TO_TICKS(80));
@@ -1393,7 +1509,10 @@ static bool sample_identity_once(bool log_summary = false, bool include_network_
         size_t p = line.find(':');
         std::string value = trim(p == std::string::npos ? line : line.substr(p + 1));
         value.erase(std::remove(value.begin(), value.end(), '"'), value.end());
-        return value.size() >= 15 ? value : std::string();
+        for (char& ch : value) {
+            if (ch == 'f') ch = 'F';
+        }
+        return is_iccid_text(value) ? value : std::string();
     };
     if (before.iccid.size() < 15) {
         const char* iccid_cmds[] = {"AT+MCCID", "AT+ICCID", "AT+CCID"};
@@ -1406,12 +1525,17 @@ static bool sample_identity_once(bool log_summary = false, bool include_network_
     }
 
     if (before.imsi.empty()) {
-        if (send_ok("AT+CIMI", 1000, &resp)) patch.imsi = first_digits_line(resp);
+        if (send_ok("AT+CIMI", 1000, &resp)) {
+            patch.imsi = first_digits_line(resp, 14, 16);
+            if (patch.imsi.empty()) patch.imsi = first_digit_run(resp, 14, 16);
+        }
         vTaskDelay(pdMS_TO_TICKS(150));
     }
 
-    // 运营商/APN/本机号码是网络上下文字段：注册完成后采一次即可，空值也视为已尝试。
-    if (include_network_fields && !s_identity_network_attempted) {
+    // 运营商/APN 是启动展示字段，注册完成后至少要拿到运营商；本机号码很多 SIM 不返回，不阻塞启动。
+    bool need_network = include_network_fields &&
+                        (!s_identity_network_attempted || before.operatorName.empty());
+    if (need_network) {
         if (before.operatorName.empty()) {
             if (send_ok("AT+COPS?", 1500, &resp)) patch.operatorName = parse_cops(resp);
             vTaskDelay(pdMS_TO_TICKS(150));
@@ -1423,7 +1547,6 @@ static bool sample_identity_once(bool log_summary = false, bool include_network_
         if (before.phone.empty()) {
             if (send_ok("AT+CNUM", 1500, &resp)) patch.phone = parse_cnum_phone(resp);
         }
-        s_identity_network_attempted = true;
     }
 
     bool static_changed = (!patch.mfr.empty() && patch.mfr != before.mfr) ||
@@ -1439,9 +1562,12 @@ static bool sample_identity_once(bool log_summary = false, bool include_network_
                                   (!patch.iccid.empty() && !before.iccid.empty() && patch.iccid != before.iccid) ||
                                   (!patch.imsi.empty() && !before.imsi.empty() && patch.imsi != before.imsi);
     bool changed = static_changed || network_changed;
-    s_identity_static_attempted = true;
     update_status(patch, true, false);
     IdfModemStatus after = idf_modem_get_status();
+    s_identity_static_attempted = !after.mfr.empty() && !after.model.empty() && !after.fwver.empty();
+    if (include_network_fields) {
+        s_identity_network_attempted = !after.operatorName.empty();
+    }
     if (material_static_change) {
         ESP_LOGI(TAG, "identity changed imei=%s iccid=%s imsi=%s",
                  after.imei.empty() ? "-" : after.imei.c_str(),
@@ -1498,6 +1624,32 @@ static bool wait_at_ready(void)
     return false;
 }
 
+static bool modem_hot_start_allowed(esp_reset_reason_t reason)
+{
+    switch (reason) {
+        case ESP_RST_PANIC:
+        case ESP_RST_INT_WDT:
+        case ESP_RST_TASK_WDT:
+        case ESP_RST_WDT:
+        case ESP_RST_CPU_LOCKUP:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static bool modem_quick_start_allowed(esp_reset_reason_t reason)
+{
+    switch (reason) {
+        case ESP_RST_POWERON:
+        case ESP_RST_SW:
+        case ESP_RST_EXT:
+            return true;
+        default:
+            return false;
+    }
+}
+
 static void configure_sms_and_registration(void)
 {
     send_ok("ATE0", 1000);
@@ -1552,10 +1704,8 @@ static void handle_reset_request_if_any(void)
     patch.phase = "at_ready";
     update_status(patch);
     configure_sms_and_registration();
-    sample_signal_once();
     set_phase("registering");
     apply_startup_data_mode();
-    sample_identity_once(true, false);
     s_reinit_pending = false;
 }
 
@@ -1575,7 +1725,6 @@ static void run_pending_reinit_if_recovered(void)
     configure_sms_and_registration();
     set_phase("registering");
     apply_startup_data_mode();
-    sample_identity_once(true, false);
     s_reinit_pending = false;
 }
 
@@ -1587,13 +1736,31 @@ static void modem_task(void*)
     update_status(patch);
     reset_identity_sampling_state();
 
-    // 热启动快路径：先拉高 EN 保持供电并直接探测 AT。ESP32 软重启(网页重启/每日
-    // 定时重启/OTA)后模组通常仍在正常运行，跳过 2.7s 断电上电，短信收发更快恢复；
-    // 冷上电时 EN 从 t=0 就拉高，模组提前开始开机，探测不到再走完整上电重试(行为不变)。
-    modem_power_hold_on();
-    if (wait_at_ready()) {
-        idf_log_line("模组已在运行，跳过断电上电(热启动)");
+    bool at_ready = false;
+    esp_reset_reason_t reset_reason = esp_reset_reason();
+    // 热启动快路径只留给崩溃/看门狗等意外复位；正常上电/软件重启先快速拉高 EN 探测，
+    // 能直接 AT 就省掉强制断电周期。USB/串口复位仍冷启动，避免烧录后沿用半初始化状态。
+    if (modem_hot_start_allowed(reset_reason)) {
+        modem_power_hold_on();
+        if (wait_at_ready()) {
+            at_ready = true;
+            idf_log_line("模组已在运行，跳过断电上电(热启动)");
+        } else {
+            idf_log_line("意外复位后热启动探测失败，改为模组冷启动");
+        }
+    } else if (modem_quick_start_allowed(reset_reason)) {
+        modem_power_hold_on();
+        if (wait_at_ready()) {
+            at_ready = true;
+            idf_logf("复位原因 %d，模组快速上电完成", static_cast<int>(reset_reason));
+        } else {
+            idf_logf("复位原因 %d，模组快速上电超时，改为冷启动", static_cast<int>(reset_reason));
+        }
     } else {
+        idf_logf("复位原因 %d，模组执行冷启动", static_cast<int>(reset_reason));
+    }
+
+    if (!at_ready) {
         // 启动握手：失败绝不放弃(Arduino 版靠 modemHealthTick 无限恢复)。任务一旦退出，
         // 网页重启模组、URC 轮询、健康探测全部失效，设备只能整机断电才能恢复。
         modem_power_cycle();
@@ -1621,10 +1788,8 @@ static void modem_task(void*)
 
     configure_sms_and_registration();
 
-    sample_signal_once();
     set_phase("registering");
     apply_startup_data_mode();
-    sample_identity_once(true, false);
 
     int check_count = 0;
     int stat = -1;
@@ -1633,12 +1798,11 @@ static void modem_task(void*)
         if (send_ok("AT+CEREG?", 1200, &resp) && parse_cereg(resp, stat)) {
             IdfModemStatus reg_patch;
             reg_patch.ceregStat = stat;
-            reg_patch.phase = (stat == 1 || stat == 5) ? "ready" : "registering";
+            reg_patch.phase = (stat == 1 || stat == 5) ? "sampling" : "registering";
             reg_patch.modemReady = (stat == 1 || stat == 5);
             update_status(reg_patch);
             if (reg_patch.modemReady) break;
         }
-        if ((check_count % 4) == 0) sample_signal_once();
         vTaskDelay(pdMS_TO_TICKS(1500));
     }
     bool registered = (stat == 1 || stat == 5);
@@ -1648,10 +1812,13 @@ static void modem_task(void*)
     } else {
         IdfSimSettingsView cfg = idf_config_get_sim_settings_view();
         apply_operator_if_configured(cfg);
-        if (!identity_complete() || !s_identity_network_attempted) sample_identity_once(false, true);
         if (cfg.dataEnabled) sample_cell_ip_once();
+        // 注册成功后立即做一轮首页基础信息采样；Web/WiFi 已先启动，不会阻塞页面打开。
+        sample_signal_once();
         sample_signal_detail_once();
-        post_register_done = true;
+        sample_identity_once(false, true);
+        post_register_done = startup_info_complete();
+        set_phase(post_register_done ? "ready" : "sampling");
     }
 
     TickType_t last_signal = 0;
@@ -1668,24 +1835,36 @@ static void modem_task(void*)
             vTaskDelay(pdMS_TO_TICKS(200));
             continue;
         }
-        // 概览页正被轮询时提频采样(10s/30s)，网页显示的信号更实时；无人查看恢复 30s/120s
-        bool web_active = (esp_timer_get_time() -
+        // 用户手动刷新会绕过常规间隔并尽快跑一轮；若 AT 正忙，请求保留到下轮空闲时执行。
+        bool force_sample = s_status_sample_requests.load(std::memory_order_relaxed) > 0;
+        bool web_active = force_sample ||
+                          (esp_timer_get_time() -
                            s_last_web_poll_us.load(std::memory_order_relaxed)) < WEB_POLL_ACTIVE_WINDOW_US;
-        uint32_t signal_interval_ms = web_active ? SIGNAL_INTERVAL_WEB_MS : 30000UL;
-        uint32_t detail_interval_ms = web_active ? SIGNAL_DETAIL_INTERVAL_WEB_MS : SIGNAL_DETAIL_INTERVAL_MS;
-        if (now - last_signal > pdMS_TO_TICKS(signal_interval_ms) && at_channel_idle_now()) {
-            sample_signal_once();
-            last_signal = now;
-        }
-        if (now - last_detail > pdMS_TO_TICKS(detail_interval_ms) && at_channel_idle_now()) {
-            sample_signal_detail_once();
-            last_detail = now;
-        }
-        if (!identity_complete() &&
-            now - last_identity > pdMS_TO_TICKS(IDENTITY_RETRY_INTERVAL_MS) &&
-            at_channel_idle_now()) {
-            sample_identity_once(false, false);
-            last_identity = now;
+        bool startup_sampling = registered && !post_register_done;
+        if ((web_active || startup_sampling) && at_channel_idle_now()) {
+            if (force_sample) {
+                s_status_sample_requests.store(0, std::memory_order_relaxed);
+            }
+            if (startup_sampling || force_sample || last_signal == 0 ||
+                now - last_signal > pdMS_TO_TICKS(SIGNAL_INTERVAL_WEB_MS)) {
+                sample_signal_once();
+                last_signal = now;
+            }
+            if (startup_sampling || force_sample || last_detail == 0 ||
+                now - last_detail > pdMS_TO_TICKS(SIGNAL_DETAIL_INTERVAL_WEB_MS)) {
+                sample_signal_detail_once();
+                last_detail = now;
+            }
+            if ((startup_sampling || force_sample || !startup_info_complete()) &&
+                (startup_sampling || force_sample || last_identity == 0 ||
+                 now - last_identity > pdMS_TO_TICKS(IDENTITY_RETRY_INTERVAL_MS))) {
+                sample_identity_once(false, true);
+                last_identity = now;
+            }
+            if (startup_sampling && startup_info_complete()) {
+                set_phase("ready");
+                post_register_done = true;
+            }
         }
         // 健康探测按 60s 门控(对齐 Arduino MODEM_HEALTH_INTERVAL_MS)，
         // 不再每 ~5s 抢占 AT 通道与 URC 竞争
@@ -1698,20 +1877,24 @@ static void modem_task(void*)
                 IdfModemStatus reg_patch;
                 reg_patch.ceregStat = stat;
                 reg_patch.modemReady = now_ready;
-                reg_patch.phase = now_ready ? "ready" : "registering";
+                reg_patch.phase = now_ready ? (post_register_done ? "ready" : "sampling") : "registering";
                 update_status(reg_patch);
                 if (now_ready) {
+                    registered = true;
                     dereg_count = 0;
                     if (!post_register_done) {
-                        // 迟到/恢复的注册也要补跑注册后步骤(运营商锁定、网络身份、信号详情)
+                        // 迟到/恢复的注册也要补跑必须的网络配置和首页基础信息。
                         IdfSimSettingsView cfg = idf_config_get_sim_settings_view();
                         apply_operator_if_configured(cfg);
-                        if (!identity_complete() || !s_identity_network_attempted) sample_identity_once(false, true);
                         if (cfg.dataEnabled) sample_cell_ip_once();
+                        sample_signal_once();
                         sample_signal_detail_once();
-                        post_register_done = true;
+                        sample_identity_once(false, true);
+                        post_register_done = startup_info_complete();
+                        set_phase(post_register_done ? "ready" : "sampling");
                     }
                 } else {
+                    registered = false;
                     post_register_done = false;
                     // AT 正常但长时间未注册(射频卡死/SIM 掉网)：这是 Arduino 版"3 天后只发不收"
                     // 的经典故障形态，累计 5 次(约 5 分钟)后硬重启自愈
@@ -1728,6 +1911,10 @@ static void modem_task(void*)
             }
         }
         for (int i = 0; i < 10; ++i) {
+            // 采样请求只有 AT 空闲时才会被外层消费；通道被长任务(保号下载/eSIM)
+            // 占用期间若无条件 break，外层 while 会变成无延时热自旋，饿死 idle 任务
+            if (s_status_sample_requests.load(std::memory_order_relaxed) > 0 &&
+                at_channel_idle_now()) break;
             // 事件驱动等待：UART 一有数据(URC/短信直推)立刻醒来抓取；
             // 无事件时 500ms 超时兜底轮询，节奏与原轮询一致
             uart_event_t evt;
@@ -1743,6 +1930,8 @@ static void modem_task(void*)
             if (!poll_unsolicited_uart(20)) vTaskDelay(pdMS_TO_TICKS(100));
             // 重启请求/AT恢复补初始化尽快响应，不等满 5s 轮询窗
             if (s_reset_request.load(std::memory_order_relaxed) != 0) break;
+            if (s_status_sample_requests.load(std::memory_order_relaxed) > 0 &&
+                at_channel_idle_now()) break;
         }
     }
 }
@@ -1760,7 +1949,6 @@ esp_err_t idf_modem_start(const IdfConfig& config)
         return ESP_ERR_NO_MEM;
     }
     if (!config.dataEnabled) set_status_cell_ip("");
-    load_identity_cache();
 
     uart_config_t uart_cfg = {};
     uart_cfg.baud_rate = MODEM_BAUD;
@@ -1834,9 +2022,10 @@ bool idf_modem_at_idle(void)
     return at_channel_idle_now();
 }
 
-void idf_modem_note_web_poll(void)
+void idf_modem_request_status_sample(void)
 {
     s_last_web_poll_us.store(esp_timer_get_time(), std::memory_order_relaxed);
+    s_status_sample_requests.fetch_add(1, std::memory_order_relaxed);
 }
 
 void idf_modem_power_off_for_restart(void)

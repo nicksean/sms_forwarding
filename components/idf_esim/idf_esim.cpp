@@ -106,6 +106,20 @@ static bool all_digits(const std::string& value)
     return true;
 }
 
+static bool parse_positive_int_token(const std::string& value, int& out)
+{
+    std::string text = trim_copy(value);
+    if (!all_digits(text)) return false;
+    int parsed = 0;
+    for (char ch : text) {
+        parsed = parsed * 10 + (ch - '0');
+        if (parsed > 999) return false;
+    }
+    if (parsed <= 0) return false;
+    out = parsed;
+    return true;
+}
+
 static std::string compact_digits(const std::string& value)
 {
     std::string out;
@@ -161,9 +175,12 @@ static std::string eid_decode(const std::vector<uint8_t>& value)
 
 static int tlv_int_value(const Tlv& tlv, int def = 0)
 {
-    int out = 0;
-    for (uint8_t b : tlv.value) out = (out << 8) | b;
-    return tlv.value.empty() ? def : out;
+    if (tlv.value.empty()) return def;
+    // 卡片可控数据：仅取尾部 4 字节，防止超长 TLV 左移出符号位(有符号溢出为 UB)
+    uint32_t out = 0;
+    size_t start = tlv.value.size() > 4 ? tlv.value.size() - 4 : 0;
+    for (size_t i = start; i < tlv.value.size(); ++i) out = (out << 8) | tlv.value[i];
+    return static_cast<int>(out);
 }
 
 static bool tag_is(const Tlv& tlv, const uint8_t* tag, size_t len)
@@ -355,10 +372,7 @@ static bool parse_ccho_channel(const std::string& resp, int& channel)
     if (!line.empty()) {
         const char* p = strchr(line.c_str(), ':');
         if (!p) return false;
-        while (*p && !isdigit(static_cast<unsigned char>(*p))) ++p;
-        if (!*p) return false;
-        channel = atoi(p);
-        return channel > 0;
+        return parse_positive_int_token(p + 1, channel);
     }
 
     // 有些模组只返回裸数字；跳过 echo/OK/空行。
@@ -368,12 +382,7 @@ static bool parse_ccho_channel(const std::string& resp, int& channel)
         if (end == std::string::npos) end = resp.size();
         std::string row = trim_copy(resp.substr(pos, end - pos));
         if (!row.empty() && row != "OK" && row.rfind("AT+", 0) != 0) {
-            bool digits = true;
-            for (char ch : row) digits = digits && isdigit(static_cast<unsigned char>(ch));
-            if (digits) {
-                channel = atoi(row.c_str());
-                return channel > 0;
-            }
+            if (parse_positive_int_token(row, channel)) return true;
         }
         pos = end + 1;
     }

@@ -1,6 +1,8 @@
 #include "idf_web.h"
 
 #include <ctype.h>
+#include <errno.h>
+#include <limits.h>
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
@@ -11,7 +13,9 @@
 #include <new>
 
 #include "driver/temperature_sensor.h"
+#include "esp_core_dump.h"
 #include "esp_ota_ops.h"
+#include "esp_partition.h"
 #include "esp_heap_caps.h"
 #include "esp_http_server.h"
 #include "esp_log.h"
@@ -111,6 +115,14 @@ static bool epoch_valid(uint32_t epoch)
     return epoch >= 1700000000u;
 }
 
+static bool push_key_sensitive(uint8_t type, int slot)
+{
+    if (slot == 1) {
+        return type == 2 || type == 4 || type == 5 || type == 6 || type == 8 || type == 9;
+    }
+    return slot == 2 && type == 10;
+}
+
 static std::string format_tz_offset(int tz_offset_min)
 {
     if (tz_offset_min == 0) return "UTC";
@@ -205,6 +217,28 @@ static bool cache_has_token(const char* cache_control, const char* token)
     return cache_control && strstr(cache_control, token) != nullptr;
 }
 
+static void set_no_cache_headers(httpd_req_t* req)
+{
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store, max-age=0");
+    httpd_resp_set_hdr(req, "Pragma", "no-cache");
+}
+
+static void set_json_no_cache(httpd_req_t* req)
+{
+    httpd_resp_set_type(req, "application/json");
+    set_no_cache_headers(req);
+}
+
+static bool ensure_get_or_post(httpd_req_t* req)
+{
+    if (req->method == HTTP_GET || req->method == HTTP_POST) return true;
+    set_json_no_cache(req);
+    httpd_resp_set_status(req, "405 Method Not Allowed");
+    httpd_resp_set_hdr(req, "Allow", "GET, POST");
+    httpd_resp_sendstr(req, "{\"success\":false,\"message\":\"该接口只支持 GET/POST\"}");
+    return false;
+}
+
 static esp_err_t send_gzip_asset(httpd_req_t* req, const WebAsset& asset, const char* cache_control)
 {
     const bool no_store = cache_has_token(cache_control, "no-store");
@@ -269,10 +303,14 @@ static esp_err_t handle_ui_panel(httpd_req_t* req)
 static esp_err_t handle_status(httpd_req_t* req)
 {
     if (!check_auth(req)) return ESP_OK;
-    idf_modem_note_web_poll();  // 概览页在看时，模组信号采样自动提频
-    httpd_resp_set_type(req, "application/json");
-    httpd_resp_set_hdr(req, "Cache-Control", "no-store, max-age=0");
-    httpd_resp_set_hdr(req, "Pragma", "no-cache");
+    char query[32] = {};
+    char sample[8] = {};
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK &&
+        httpd_query_key_value(query, "sample", sample, sizeof(sample)) == ESP_OK &&
+        strcmp(sample, "1") == 0) {
+        idf_modem_request_status_sample();
+    }
+    set_json_no_cache(req);
 
     // 窄快照：/status 每 2s 轮询一次，避免全量配置深拷贝造成持续堆抖动
     const IdfConfigStatusView cfg = idf_config_get_status_view();
@@ -406,9 +444,7 @@ static esp_err_t handle_status(httpd_req_t* req)
 static esp_err_t send_config_json(httpd_req_t* req)
 {
     if (!check_auth(req)) return ESP_OK;
-    httpd_resp_set_type(req, "application/json");
-    httpd_resp_set_hdr(req, "Cache-Control", "no-store, max-age=0");
-    httpd_resp_set_hdr(req, "Pragma", "no-cache");
+    set_json_no_cache(req);
 
     const IdfConfigWebView cfg = idf_config_get_web_view();
     std::string body;
@@ -416,11 +452,14 @@ static esp_err_t send_config_json(httpd_req_t* req)
     char buf[256];
     body += "{";
     json_prop(body, "webUser", cfg.webUser); body += ",";
-    json_prop(body, "webPass", cfg.webPass); body += ",";
+    // 密码字段只用于表单占位，不能在配置 JSON 中回显明文。
+    json_prop(body, "webPass", ""); body += ",";
     json_prop(body, "smtpServer", cfg.smtpServer); body += ",";
     snprintf(buf, sizeof(buf), "\"smtpPort\":%d,", cfg.smtpPort); body += buf;
     json_prop(body, "smtpUser", cfg.smtpUser); body += ",";
-    json_prop(body, "smtpPass", cfg.smtpPass); body += ",";
+    json_prop(body, "smtpPass", ""); body += ",";
+    snprintf(buf, sizeof(buf), "\"smtpPassSet\":%s,", cfg.smtpPass.empty() ? "false" : "true");
+    body += buf;
     json_prop(body, "smtpSendTo", cfg.smtpSendTo); body += ",";
     json_prop(body, "adminPhone", cfg.adminPhone); body += ",";
     json_prop(body, "numberBlackList", cfg.numberBlackList); body += ",";
@@ -457,10 +496,18 @@ static esp_err_t send_config_json(httpd_req_t* req)
         snprintf(buf, sizeof(buf), "{\"enabled\":%s,\"type\":%u,",
                  ch.enabled ? "true" : "false", static_cast<unsigned>(ch.type));
         body += buf;
+        bool key1_redacted = push_key_sensitive(ch.type, 1);
+        bool key2_redacted = push_key_sensitive(ch.type, 2);
         json_prop(body, "name", ch.name); body += ",";
         json_prop(body, "url", ch.url); body += ",";
-        json_prop(body, "key1", ch.key1); body += ",";
-        json_prop(body, "key2", ch.key2); body += ",";
+        json_prop(body, "key1", key1_redacted ? std::string() : ch.key1); body += ",";
+        snprintf(buf, sizeof(buf), "\"key1Set\":%s,\"key1Redacted\":%s,",
+                 ch.key1.empty() ? "false" : "true", key1_redacted ? "true" : "false");
+        body += buf;
+        json_prop(body, "key2", key2_redacted ? std::string() : ch.key2); body += ",";
+        snprintf(buf, sizeof(buf), "\"key2Set\":%s,\"key2Redacted\":%s,",
+                 ch.key2.empty() ? "false" : "true", key2_redacted ? "true" : "false");
+        body += buf;
         json_prop(body, "customBody", ch.customBody);
         body += "}";
     }
@@ -515,18 +562,29 @@ static std::string url_decode(const char* data, size_t len)
 static esp_err_t read_body(httpd_req_t* req, std::string& body, size_t max_len = 8192)
 {
     if (req->content_len > max_len) {
+        set_no_cache_headers(req);
         httpd_resp_send_err(req, HTTPD_413_CONTENT_TOO_LARGE, "Body too large");
         return ESP_FAIL;
     }
     body.assign(req->content_len, '\0');
     size_t received = 0;
     int timeouts = 0;
+    // 连续超时计数会被任何字节进展清零，涓流客户端(每十几秒发 1 字节)能把
+    // httpd 唯一 worker 卡住数小时——必须叠加总时长硬上限
+    const TickType_t start_tick = xTaskGetTickCount();
+    const TickType_t hard_span = pdMS_TO_TICKS(30000);
     while (received < body.size()) {
+        if (static_cast<TickType_t>(xTaskGetTickCount() - start_tick) >= hard_span) {
+            set_no_cache_headers(req);
+            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Receive too slow");
+            return ESP_FAIL;
+        }
         int ret = httpd_req_recv(req, body.data() + received, body.size() - received);
         if (ret <= 0) {
             // 超时最多容忍 3 次(~15s)：httpd 单任务串行处理请求，
             // 一个挂着不发数据的客户端会把整个 Web UI 卡死到重启
             if (ret == HTTPD_SOCK_ERR_TIMEOUT && ++timeouts <= 3) continue;
+            set_no_cache_headers(req);
             httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Receive failed");
             return ESP_FAIL;
         }
@@ -538,7 +596,7 @@ static esp_err_t read_body(httpd_req_t* req, std::string& body, size_t max_len =
 
 static void send_modem_busy_json(httpd_req_t* req)
 {
-    httpd_resp_set_type(req, "application/json");
+    set_json_no_cache(req);
     httpd_resp_sendstr(req, "{\"success\":false,\"message\":\"模组或蜂窝/eSIM 任务正忙，请稍后重试\"}");
 }
 
@@ -617,13 +675,51 @@ static std::string field_text(const IdfFormFields& fields, const char* key)
     return value ? *value : std::string();
 }
 
+static bool field_blank(const std::string& value)
+{
+    for (char ch : value) {
+        if (!isspace(static_cast<unsigned char>(ch))) return false;
+    }
+    return true;
+}
+
+static bool parse_int_strict(const std::string& text, int& out)
+{
+    errno = 0;
+    char* end = nullptr;
+    long parsed = strtol(text.c_str(), &end, 10);
+    if (end == text.c_str() || errno == ERANGE || parsed < INT_MIN || parsed > INT_MAX) {
+        return false;
+    }
+    while (*end != '\0') {
+        if (!isspace(static_cast<unsigned char>(*end))) return false;
+        ++end;
+    }
+    out = static_cast<int>(parsed);
+    return true;
+}
+
+static bool parse_u32_strict(const char* raw, uint32_t& value, bool allow_zero)
+{
+    if (!raw || raw[0] == '\0') return false;
+    uint32_t parsed = 0;
+    for (size_t i = 0; raw[i] != '\0'; ++i) {
+        if (!isdigit(static_cast<unsigned char>(raw[i]))) return false;
+        uint8_t digit = static_cast<uint8_t>(raw[i] - '0');
+        if (parsed > 429496729U || (parsed == 429496729U && digit > 5)) return false;
+        parsed = parsed * 10U + digit;
+    }
+    if (!allow_zero && parsed == 0) return false;
+    value = parsed;
+    return true;
+}
+
 static int field_int(const IdfFormFields& fields, const char* key, int fallback)
 {
     const std::string* value = find_field(fields, key);
     if (!value) return fallback;
-    char* end = nullptr;
-    long parsed = strtol(value->c_str(), &end, 10);
-    return end != value->c_str() ? static_cast<int>(parsed) : fallback;
+    int parsed = fallback;
+    return parse_int_strict(*value, parsed) ? parsed : fallback;
 }
 
 static uint8_t field_u8(const IdfFormFields& fields, const char* key, uint8_t fallback)
@@ -659,29 +755,81 @@ static std::string first_line_containing(const std::string& resp, const char* ne
 
 static std::string first_digits(const std::string& resp)
 {
-    for (size_t i = 0; i < resp.size(); ++i) {
-        if (!isdigit(static_cast<unsigned char>(resp[i]))) continue;
-        size_t j = i;
-        while (j < resp.size() && isdigit(static_cast<unsigned char>(resp[j]))) ++j;
-        if (j - i >= 10) return resp.substr(i, j - i);
-        i = j;
+    size_t pos = 0;
+    while (pos < resp.size()) {
+        size_t end = resp.find('\n', pos);
+        if (end == std::string::npos) end = resp.size();
+        std::string line = resp.substr(pos, end - pos);
+        while (!line.empty() && isspace(static_cast<unsigned char>(line.front()))) line.erase(0, 1);
+        while (!line.empty() && isspace(static_cast<unsigned char>(line.back()))) line.pop_back();
+        bool digits = !line.empty();
+        for (char ch : line) digits = digits && isdigit(static_cast<unsigned char>(ch));
+        if (digits && line.size() >= 14 && line.size() <= 17) return line;
+        pos = end + 1;
+    }
+
+    size_t start = std::string::npos;
+    for (size_t i = 0; i <= resp.size(); ++i) {
+        bool digit = i < resp.size() && isdigit(static_cast<unsigned char>(resp[i]));
+        if (digit && start == std::string::npos) start = i;
+        if (!digit && start != std::string::npos) {
+            size_t len = i - start;
+            if (len >= 14 && len <= 17) return resp.substr(start, len);
+            start = std::string::npos;
+        }
     }
     return {};
+}
+
+static bool parse_cfun_mode_line(const std::string& line, int& mode)
+{
+    const char* p = strstr(line.c_str(), "+CFUN:");
+    if (!p) return false;
+    int parsed = -1;
+    if (!parse_int_strict(std::string(p + strlen("+CFUN:")), parsed)) return false;
+    if (parsed < 0 || parsed > 4) return false;
+    mode = parsed;
+    return true;
+}
+
+static bool parse_csq_line(const std::string& line, int& rssi, int& ber)
+{
+    const char* p = strstr(line.c_str(), "+CSQ:");
+    if (!p) return false;
+    std::string rest = p + strlen("+CSQ:");
+    size_t comma = rest.find(',');
+    if (comma == std::string::npos) return false;
+    int parsed_rssi = 99;
+    int parsed_ber = 99;
+    if (!parse_int_strict(rest.substr(0, comma), parsed_rssi)) return false;
+    if (!parse_int_strict(rest.substr(comma + 1), parsed_ber)) return false;
+    if (!((parsed_rssi >= 0 && parsed_rssi <= 31) || parsed_rssi == 99)) return false;
+    if (!((parsed_ber >= 0 && parsed_ber <= 7) || parsed_ber == 99)) return false;
+    rssi = parsed_rssi;
+    ber = parsed_ber;
+    return true;
 }
 
 static esp_err_t handle_at(httpd_req_t* req)
 {
     if (!check_auth(req)) return ESP_OK;
+    if (!ensure_get_or_post(req)) return ESP_OK;
+    if (req->method != HTTP_POST) {
+        set_json_no_cache(req);
+        return httpd_resp_sendstr(req, "{\"success\":false,\"message\":\"AT 指令需要 POST\"}");
+    }
     char query[192] = {};
     char cmd_raw[96] = {};
     if (httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK ||
         httpd_query_key_value(query, "cmd", cmd_raw, sizeof(cmd_raw)) != ESP_OK) {
+        set_no_cache_headers(req);
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing cmd");
         return ESP_OK;
     }
 
     std::string cmd = url_decode(cmd_raw, strlen(cmd_raw));
     if (cmd.size() > 80 || cmd.find('\r') != std::string::npos || cmd.find('\n') != std::string::npos) {
+        set_no_cache_headers(req);
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid cmd");
         return ESP_OK;
     }
@@ -695,16 +843,24 @@ static esp_err_t handle_at(httpd_req_t* req)
     body += ",";
     json_prop(body, "message", resp.empty() ? std::string(esp_err_to_name(err)) : resp);
     body += "}";
-    httpd_resp_set_type(req, "application/json");
+    set_json_no_cache(req);
     return httpd_resp_send(req, body.c_str(), body.size());
 }
 
 static esp_err_t handle_flight(httpd_req_t* req)
 {
     if (!check_auth(req)) return ESP_OK;
+    if (!ensure_get_or_post(req)) return ESP_OK;
     std::string action;
     get_query_param(req, "action", action);
     if (action.empty()) action = "query";
+
+    bool change_action = (action == "toggle" || action == "on" || action == "off");
+    if (change_action && req->method != HTTP_POST) {
+        set_json_no_cache(req);
+        return httpd_resp_sendstr(req, "{\"success\":false,\"message\":\"飞行模式切换需要 POST\"}");
+    }
+
     WebModemActionGuard modem_action;
     if (!modem_action.begin(req)) return ESP_OK;
 
@@ -712,19 +868,16 @@ static esp_err_t handle_flight(httpd_req_t* req)
     bool success = false;
     std::string message;
     int mode = -1;
+
     if (idf_modem_send_at("AT+CFUN?", 3000, resp) == ESP_OK) {
         std::string line = first_line_containing(resp, "+CFUN:");
-        const char* p = strstr(line.c_str(), "+CFUN:");
-        if (p) {
-            mode = atoi(p + strlen("+CFUN:"));
-            success = true;
-        }
+        success = parse_cfun_mode_line(line, mode);
     }
 
-    if (action == "toggle" || action == "on" || action == "off") {
+    if (change_action) {
         // 查询失败(mode<0)时禁止切换：盲发 CFUN=4 会静默关掉射频、停掉短信接收
         if (mode < 0) {
-            httpd_resp_set_type(req, "application/json");
+            set_json_no_cache(req);
             return httpd_resp_sendstr(req,
                 "{\"success\":false,\"message\":\"无法获取当前飞行模式状态，已取消切换\"}");
         }
@@ -763,13 +916,14 @@ static esp_err_t handle_flight(httpd_req_t* req)
     body += ",";
     json_prop(body, "message", message);
     body += "}";
-    httpd_resp_set_type(req, "application/json");
+    set_json_no_cache(req);
     return httpd_resp_send(req, body.c_str(), body.size());
 }
 
 static esp_err_t handle_modem_control(httpd_req_t* req)
 {
     if (!check_auth(req)) return ESP_OK;
+    if (!ensure_get_or_post(req)) return ESP_OK;
     std::string action;
     get_query_param(req, "action", action);
     bool success = false;
@@ -778,6 +932,10 @@ static esp_err_t handle_modem_control(httpd_req_t* req)
     WebModemActionGuard modem_action;
     bool needs_modem = (action == "restart" || action == "hardreset" ||
                         action == "signal" || action == "operator" || action == "imei");
+    if ((action == "restart" || action == "hardreset") && req->method != HTTP_POST) {
+        set_json_no_cache(req);
+        return httpd_resp_sendstr(req, "{\"success\":false,\"message\":\"模组重启需要 POST\"}");
+    }
     if (needs_modem && !modem_action.begin(req)) return ESP_OK;
 
     if (action == "restart" || action == "hardreset") {
@@ -794,7 +952,7 @@ static esp_err_t handle_modem_control(httpd_req_t* req)
         std::string line = first_line_containing(resp, "+CSQ:");
         int rssi = 99;
         int ber = 99;
-        if (err == ESP_OK && sscanf(line.c_str(), "+CSQ: %d,%d", &rssi, &ber) == 2) {
+        if (err == ESP_OK && parse_csq_line(line, rssi, ber)) {
             int dbm = (rssi == 99) ? -999 : (-113 + rssi * 2);
             char buf[96];
             snprintf(buf, sizeof(buf), "信号强度(RSSI): %d dBm, CSQ原始值: %d, BER: %d", dbm, rssi, ber);
@@ -830,13 +988,18 @@ static esp_err_t handle_modem_control(httpd_req_t* req)
     body += ",";
     json_prop(body, "message", message);
     body += "}";
-    httpd_resp_set_type(req, "application/json");
+    set_json_no_cache(req);
     return httpd_resp_send(req, body.c_str(), body.size());
 }
 
 static esp_err_t handle_ussd(httpd_req_t* req)
 {
     if (!check_auth(req)) return ESP_OK;
+    if (!ensure_get_or_post(req)) return ESP_OK;
+    if (req->method != HTTP_POST) {
+        set_json_no_cache(req);
+        return httpd_resp_sendstr(req, "{\"success\":false,\"message\":\"USSD 查询需要 POST\"}");
+    }
     std::string code;
     get_query_param(req, "code", code);
     bool valid = !code.empty() && code.size() <= 24;
@@ -847,7 +1010,7 @@ static esp_err_t handle_ussd(httpd_req_t* req)
         }
     }
     if (!valid) {
-        httpd_resp_set_type(req, "application/json");
+        set_json_no_cache(req);
         return httpd_resp_sendstr(req, "{\"success\":false,\"message\":\"USSD 码为空或包含非法字符\"}");
     }
     WebModemActionGuard modem_action;
@@ -864,7 +1027,7 @@ static esp_err_t handle_ussd(httpd_req_t* req)
     body += ",";
     json_prop(body, "message", message);
     body += "}";
-    httpd_resp_set_type(req, "application/json");
+    set_json_no_cache(req);
     return httpd_resp_send(req, body.c_str(), body.size());
 }
 
@@ -969,7 +1132,30 @@ static void modem_apply_task(void* raw)
     finish();
 }
 
+static void preserve_redacted_push_key(const IdfFormFields& fields,
+                                       const IdfPushChannel& previous,
+                                       int index,
+                                       int slot,
+                                       IdfPushChannel& next)
+{
+    char name[32];
+    snprintf(name, sizeof(name), "push%dkey%dKeep", index, slot);
+    bool keep = field_text(fields, name) == "1";
+    snprintf(name, sizeof(name), "push%dkey%dClear", index, slot);
+    bool clear = has_field(fields, name);
+    std::string& value = (slot == 1) ? next.key1 : next.key2;
+    const std::string& old_value = (slot == 1) ? previous.key1 : previous.key2;
+    if (clear) {
+        value.clear();
+        return;
+    }
+    if (keep && next.type == previous.type && field_blank(value)) {
+        value = old_value;
+    }
+}
+
 static void parse_push_channels_form(const IdfFormFields& fields,
+                                     const IdfPushChannel previous[IDF_MAX_PUSH_CHANNELS],
                                      IdfPushChannel channels[IDF_MAX_PUSH_CHANNELS])
 {
     for (int i = 0; i < IDF_MAX_PUSH_CHANNELS; ++i) {
@@ -988,6 +1174,8 @@ static void parse_push_channels_form(const IdfFormFields& fields,
         channels[i].key2 = field_text(fields, key);
         snprintf(key, sizeof(key), "push%dbody", i);
         channels[i].customBody = field_text(fields, key);
+        preserve_redacted_push_key(fields, previous[i], i, 1, channels[i]);
+        preserve_redacted_push_key(fields, previous[i], i, 2, channels[i]);
     }
 }
 
@@ -1043,17 +1231,20 @@ static esp_err_t handle_save(httpd_req_t* req)
     if (form_count != 1) {
         idf_log_line(form_count == 0 ? "网页保存请求缺少表单标记，已忽略"
                                      : "网页保存请求包含多个表单标记，已拒绝");
+        set_no_cache_headers(req);
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
                             form_count == 0 ? "unknown save form" : "multiple save forms");
         return ESP_OK;
     }
 
     auto fail = [&](esp_err_t err) -> esp_err_t {
+        set_no_cache_headers(req);
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, esp_err_to_name(err));
         return ESP_OK;
     };
     auto ok = [&](const char* log_line) -> esp_err_t {
         httpd_resp_set_type(req, "text/plain");
+        set_no_cache_headers(req);
         httpd_resp_sendstr(req, "OK");
         idf_log_line(log_line);
         return ESP_OK;
@@ -1080,25 +1271,30 @@ static esp_err_t handle_save(httpd_req_t* req)
             return fail(err);
         }
         httpd_resp_set_type(req, "text/plain");
+        set_no_cache_headers(req);
         httpd_resp_sendstr(req, "OK");
         idf_logf("网页保存 NET 指示灯配置: %s", enabled ? "开启" : "关闭");
         return ESP_OK;
     }
 
     if (email_form) {
+        std::string smtp_pass = field_text(fields, "smtpPass");
+        bool preserve_smtp_pass = field_blank(smtp_pass);
         esp_err_t err = idf_config_save_email(has_field(fields, "emailEnabled"),
                                               field_text(fields, "smtpServer"),
                                               field_int(fields, "smtpPort", 465),
                                               field_text(fields, "smtpUser"),
-                                              field_text(fields, "smtpPass"),
-                                              field_text(fields, "smtpSendTo"));
+                                              smtp_pass,
+                                              field_text(fields, "smtpSendTo"),
+                                              preserve_smtp_pass);
         if (err != ESP_OK) return fail(err);
         return ok("网页保存邮件设置");
     }
 
     if (push_form) {
         IdfPushChannel channels[IDF_MAX_PUSH_CHANNELS];
-        parse_push_channels_form(fields, channels);
+        IdfConfigWebView current = idf_config_get_web_view();
+        parse_push_channels_form(fields, current.pushChannels, channels);
         esp_err_t err = idf_config_save_push(has_field(fields, "pushEnabled"), channels);
         if (err != ESP_OK) return fail(err);
         return ok("网页保存推送通道");
@@ -1156,6 +1352,7 @@ static esp_err_t handle_save(httpd_req_t* req)
         bool operator_changed = before.operatorPlmn != after.operatorPlmn;
 
         httpd_resp_set_type(req, "text/plain");
+        set_no_cache_headers(req);
         httpd_resp_sendstr(req, "OK");
         idf_log_line("网页保存蜂窝设置");
         if (!data_changed && !operator_changed) return ESP_OK;
@@ -1185,7 +1382,7 @@ static esp_err_t handle_export_config(httpd_req_t* req)
     if (!check_auth(req)) return ESP_OK;
     std::string body = idf_config_export_text();
     httpd_resp_set_type(req, "text/plain; charset=utf-8");
-    httpd_resp_set_hdr(req, "Cache-Control", "no-store, max-age=0");
+    set_no_cache_headers(req);
     httpd_resp_set_hdr(req, "Content-Disposition", "attachment; filename=sms_config.txt");
     return httpd_resp_send(req, body.c_str(), body.size());
 }
@@ -1197,7 +1394,7 @@ static esp_err_t handle_import_config(httpd_req_t* req)
     if (read_body(req, body, 16384) != ESP_OK) return ESP_OK;
     int applied = 0;
     esp_err_t err = idf_config_import_text(body, &applied);
-    httpd_resp_set_type(req, "application/json");
+    set_json_no_cache(req);
     if (err != ESP_OK) {
         std::string resp = "{\"success\":false,";
         json_prop(resp, "message", std::string("导入失败: ") + esp_err_to_name(err));
@@ -1222,21 +1419,28 @@ static void restart_task(void*)
     esp_restart();
 }
 
+static void schedule_restart_or_now(const char* task_name)
+{
+    if (xTaskCreate(restart_task, task_name, 3072, nullptr, 1, nullptr) == pdPASS) return;
+    idf_log_line("重启任务创建失败，改为当前任务直接重启");
+    restart_task(nullptr);
+}
+
 static esp_err_t handle_factory_reset(httpd_req_t* req)
 {
     if (!check_auth(req)) return ESP_OK;
     esp_err_t err = idf_config_factory_reset();
     if (err == ESP_OK) idf_log_line("网页触发恢复出厂：已清除全部配置，即将重启");
-    httpd_resp_set_type(req, "application/json");
+    set_json_no_cache(req);
     if (err != ESP_OK) {
         std::string body = "{\"success\":false,";
         json_prop(body, "message", std::string("恢复出厂失败: ") + esp_err_to_name(err));
         body += "}";
         return httpd_resp_send(req, body.c_str(), body.size());
     }
-    httpd_resp_sendstr(req, "{\"success\":true,\"message\":\"已清除配置，设备即将重启为默认设置\"}");
-    xTaskCreate(restart_task, "factory_restart", 2048, nullptr, 1, nullptr);
-    return ESP_OK;
+    esp_err_t send_err = httpd_resp_sendstr(req, "{\"success\":true,\"message\":\"已清除配置，设备即将重启为默认设置\"}");
+    schedule_restart_or_now("factory_restart");
+    return send_err;
 }
 
 static esp_err_t handle_wifi_config(httpd_req_t* req)
@@ -1248,26 +1452,31 @@ static esp_err_t handle_wifi_config(httpd_req_t* req)
     const std::string* ssid = find_field(fields, "ssid");
     const std::string* pass = find_field(fields, "pass");
     esp_err_t err = idf_config_save_wifi(ssid ? *ssid : std::string(), pass ? *pass : std::string());
-    httpd_resp_set_type(req, "application/json");
+    set_json_no_cache(req);
     if (err != ESP_OK) {
         std::string msg = "{\"success\":false,\"message\":\"WiFi 配置无效\"}";
         return httpd_resp_send(req, msg.c_str(), msg.size());
     }
-    xTaskCreate(restart_task, "wifi_restart", 2048, nullptr, 1, nullptr);
     std::string msg = "{\"success\":true,\"message\":\"WiFi 已保存，设备即将重启\"}";
-    return httpd_resp_send(req, msg.c_str(), msg.size());
+    esp_err_t send_err = httpd_resp_send(req, msg.c_str(), msg.size());
+    schedule_restart_or_now("wifi_restart");
+    return send_err;
 }
 
 static esp_err_t handle_wifi(httpd_req_t* req)
 {
     if (!check_auth(req)) return ESP_OK;
+    if (!ensure_get_or_post(req)) return ESP_OK;
     char query[64] = {};
     char action[24] = {};
     if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
         httpd_query_key_value(query, "action", action, sizeof(action));
     }
-    httpd_resp_set_type(req, "application/json");
+    set_json_no_cache(req);
     if (strcmp(action, "restart") == 0) {
+        if (req->method != HTTP_POST) {
+            return httpd_resp_sendstr(req, "{\"success\":false,\"message\":\"WiFi 重连需要 POST\"}");
+        }
         esp_err_t err = idf_wifi_reconnect();
         if (err == ESP_OK) idf_log_line("网页触发 WiFi 重连");
         std::string msg = err == ESP_OK
@@ -1287,8 +1496,7 @@ static esp_err_t handle_wifi(httpd_req_t* req)
 static esp_err_t handle_wifi_scan(httpd_req_t* req)
 {
     if (!check_auth(req)) return ESP_OK;
-    httpd_resp_set_type(req, "application/json");
-    httpd_resp_set_hdr(req, "Cache-Control", "no-store, max-age=0");
+    set_json_no_cache(req);
     std::string body;
     esp_err_t err = idf_wifi_scan_json(body);
     if (err != ESP_OK) {
@@ -1358,7 +1566,15 @@ static esp_err_t handle_ota_update(httpd_req_t* req)
     const size_t keep_tail = boundary_marker.size() + 8;
 
     int timeouts = 0;
+    // 涓流上传防护：连续超时计数外再加总时长硬上限。局域网正常 OTA 只要几十秒，
+    // 5 分钟兜底既容忍慢 WiFi，也保证 Web 不会被拖死一整天
+    const TickType_t ota_start_tick = xTaskGetTickCount();
+    const TickType_t ota_hard_span = pdMS_TO_TICKS(300000);
     while (received < req->content_len && err == ESP_OK) {
+        if (static_cast<TickType_t>(xTaskGetTickCount() - ota_start_tick) >= ota_hard_span) {
+            err = ESP_ERR_TIMEOUT;
+            break;
+        }
         int got = httpd_req_recv(req, buf, std::min(sizeof(buf), static_cast<size_t>(req->content_len - received)));
         if (got <= 0) {
             // 上传中断的客户端不能无限重试，否则 OTA 句柄一直占着、Web 全站失去响应
@@ -1416,7 +1632,7 @@ static esp_err_t handle_ota_update(httpd_req_t* req)
     else esp_ota_abort(ota);
     if (err == ESP_OK) err = esp_ota_set_boot_partition(part);
 
-    httpd_resp_set_type(req, "application/json");
+    set_json_no_cache(req);
     if (err != ESP_OK) {
         std::string body = "{\"success\":false,";
         json_prop(body, "message", std::string("升级失败: ") + esp_err_to_name(err));
@@ -1426,9 +1642,9 @@ static esp_err_t handle_ota_update(httpd_req_t* req)
     }
 
     idf_logf("OTA 完成: %u 字节，准备重启", static_cast<unsigned>(written));
-    httpd_resp_sendstr(req, "{\"success\":true,\"message\":\"升级成功，设备重启中\"}");
-    xTaskCreate(restart_task, "ota_restart", 2048, nullptr, 1, nullptr);
-    return ESP_OK;
+    esp_err_t send_err = httpd_resp_sendstr(req, "{\"success\":true,\"message\":\"升级成功，设备重启中\"}");
+    schedule_restart_or_now("ota_restart");
+    return send_err;
 }
 
 static esp_err_t handle_send_sms(httpd_req_t* req)
@@ -1450,7 +1666,7 @@ static esp_err_t handle_send_sms(httpd_req_t* req)
     body += ",";
     json_prop(body, "message", msg);
     body += "}";
-    httpd_resp_set_type(req, "application/json");
+    set_json_no_cache(req);
     return httpd_resp_send(req, body.c_str(), body.size());
 }
 
@@ -1468,11 +1684,11 @@ static esp_err_t handle_messages(httpd_req_t* req)
             sent_box = true;
         }
         if (httpd_query_key_value(query, "limit", limit_raw, sizeof(limit_raw)) == ESP_OK) {
-            limit = atoi(limit_raw);
+            int parsed_limit = 0;
+            if (parse_int_strict(limit_raw, parsed_limit)) limit = parsed_limit;
         }
     }
-    httpd_resp_set_type(req, "application/json");
-    httpd_resp_set_hdr(req, "Cache-Control", "no-store, max-age=0");
+    set_json_no_cache(req);
     std::string body = idf_inbox_json(sent_box, limit);
     return httpd_resp_send(req, body.c_str(), body.size());
 }
@@ -1480,14 +1696,13 @@ static esp_err_t handle_messages(httpd_req_t* req)
 static esp_err_t handle_empty_log(httpd_req_t* req)
 {
     if (!check_auth(req)) return ESP_OK;
-    httpd_resp_set_type(req, "application/json");
-    httpd_resp_set_hdr(req, "Cache-Control", "no-store, max-age=0");
+    set_json_no_cache(req);
     char query[64] = {};
     char since_raw[24] = {};
     uint32_t since = 0;
     if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK &&
         httpd_query_key_value(query, "since", since_raw, sizeof(since_raw)) == ESP_OK) {
-        since = static_cast<uint32_t>(strtoul(since_raw, nullptr, 10));
+        parse_u32_strict(since_raw, since, true);
     }
     std::string body = idf_log_json_since(since);
     return httpd_resp_send(req, body.c_str(), body.size());
@@ -1497,9 +1712,85 @@ static esp_err_t handle_log_download(httpd_req_t* req)
 {
     if (!check_auth(req)) return ESP_OK;
     httpd_resp_set_type(req, "text/plain; charset=utf-8");
+    set_no_cache_headers(req);
     httpd_resp_set_hdr(req, "Content-Disposition", "attachment; filename=sms_idf_log.txt");
     std::string body = idf_log_text_dump();
     return httpd_resp_send(req, body.c_str(), body.size());
+}
+
+static esp_err_t handle_prev_log(httpd_req_t* req)
+{
+    if (!check_auth(req)) return ESP_OK;
+    httpd_resp_set_type(req, "text/plain; charset=utf-8");
+    set_no_cache_headers(req);
+    char query[32] = {};
+    char dl_raw[8] = {};
+    // ?dl=1 时按附件下载，否则浏览器内直接查看
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK &&
+        httpd_query_key_value(query, "dl", dl_raw, sizeof(dl_raw)) == ESP_OK &&
+        strcmp(dl_raw, "1") == 0) {
+        httpd_resp_set_hdr(req, "Content-Disposition", "attachment; filename=sms_idf_prev_log.txt");
+    }
+    std::string body = idf_log_prev_dump();
+    if (body.empty()) {
+        body = "（暂无上次运行日志：设备可能刚上电，且没有已保存的异常复位日志）";
+    }
+    return httpd_resp_send(req, body.c_str(), body.size());
+}
+
+// 下载崩溃转储原始镜像，可在电脑上用
+// espcoredump.py info_corefile --core coredump.bin --core-format raw 解析完整回溯
+static esp_err_t handle_coredump_download(httpd_req_t* req)
+{
+    if (!check_auth(req)) return ESP_OK;
+    size_t addr = 0;
+    size_t size = 0;
+    if (esp_core_dump_image_get(&addr, &size) != ESP_OK || size == 0) {
+        httpd_resp_set_type(req, "text/plain; charset=utf-8");
+        set_no_cache_headers(req);
+        return httpd_resp_sendstr(req, "（当前没有崩溃转储：设备上次未发生崩溃，或转储尚未写入）");
+    }
+    const esp_partition_t* part = esp_partition_find_first(
+        ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_COREDUMP, nullptr);
+    if (!part) {
+        httpd_resp_set_type(req, "text/plain; charset=utf-8");
+        set_no_cache_headers(req);
+        return httpd_resp_sendstr(req, "（未找到 coredump 分区）");
+    }
+    httpd_resp_set_type(req, "application/octet-stream");
+    set_no_cache_headers(req);
+    httpd_resp_set_hdr(req, "Content-Disposition", "attachment; filename=coredump.bin");
+    // 分块读发，避免一次性把整个转储(最大 64KB)搬进堆
+    char chunk[1024];
+    size_t offset = addr >= part->address ? addr - part->address : 0;
+    size_t remaining = size;
+    while (remaining > 0) {
+        size_t n = remaining > sizeof(chunk) ? sizeof(chunk) : remaining;
+        if (esp_partition_read(part, offset, chunk, n) != ESP_OK) {
+            // 读失败时必须让传输明确失败(断开连接)：发终止分块会让浏览器
+            // 把截断文件当完整下载，espcoredump.py 解析时才莫名报错
+            idf_logf("崩溃转储读取失败(offset=%u)，已中断下载", static_cast<unsigned>(offset));
+            return ESP_FAIL;
+        }
+        if (httpd_resp_send_chunk(req, chunk, n) != ESP_OK) return ESP_FAIL;
+        offset += n;
+        remaining -= n;
+    }
+    return httpd_resp_send_chunk(req, nullptr, 0);
+}
+
+static esp_err_t handle_coredump_clear(httpd_req_t* req)
+{
+    if (!check_auth(req)) return ESP_OK;
+    set_json_no_cache(req);
+    esp_err_t err = esp_core_dump_image_erase();
+    if (err == ESP_OK) {
+        idf_log_line("已清除崩溃转储");
+        return httpd_resp_sendstr(req, "{\"success\":true,\"message\":\"崩溃转储已清除\"}");
+    }
+    char body[128];
+    snprintf(body, sizeof(body), "{\"success\":false,\"message\":\"清除失败: %s\"}", esp_err_to_name(err));
+    return httpd_resp_send(req, body, strlen(body));
 }
 
 static bool query_u32(httpd_req_t* req, const char* key, uint32_t& value)
@@ -1510,8 +1801,27 @@ static bool query_u32(httpd_req_t* req, const char* key, uint32_t& value)
         httpd_query_key_value(query, key, raw, sizeof(raw)) != ESP_OK) {
         return false;
     }
-    value = static_cast<uint32_t>(strtoul(raw, nullptr, 10));
-    return value != 0;
+    return parse_u32_strict(raw, value, false);
+}
+
+static bool query_u8_range(httpd_req_t* req, const char* key, uint8_t max_exclusive, uint8_t& value)
+{
+    char query[96] = {};
+    char raw[8] = {};
+    if (max_exclusive == 0 ||
+        httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK ||
+        httpd_query_key_value(query, key, raw, sizeof(raw)) != ESP_OK) {
+        return false;
+    }
+    if (raw[0] == '\0') return false;
+    unsigned parsed = 0;
+    for (size_t i = 0; raw[i] != '\0'; ++i) {
+        if (!isdigit(static_cast<unsigned char>(raw[i]))) return false;
+        parsed = parsed * 10U + static_cast<unsigned>(raw[i] - '0');
+        if (parsed >= max_exclusive) return false;
+    }
+    value = static_cast<uint8_t>(parsed);
+    return true;
 }
 
 static esp_err_t handle_delete_message(httpd_req_t* req)
@@ -1519,7 +1829,7 @@ static esp_err_t handle_delete_message(httpd_req_t* req)
     if (!check_auth(req)) return ESP_OK;
     uint32_t id = 0;
     bool ok = query_u32(req, "id", id) && idf_inbox_delete(id);
-    httpd_resp_set_type(req, "application/json");
+    set_json_no_cache(req);
     return httpd_resp_sendstr(req, ok
         ? "{\"success\":true,\"message\":\"已删除\"}"
         : "{\"success\":false,\"message\":\"未找到\"}");
@@ -1531,7 +1841,7 @@ static esp_err_t handle_resend_message(httpd_req_t* req)
     uint32_t id = 0;
     IdfInboxEntry entry;
     bool found = query_u32(req, "id", id) && idf_inbox_get_by_id(id, entry);
-    httpd_resp_set_type(req, "application/json");
+    set_json_no_cache(req);
     if (!found) {
         return httpd_resp_sendstr(req, "{\"success\":false,\"message\":\"未找到该短信\"}");
     }
@@ -1545,15 +1855,21 @@ static esp_err_t handle_resend_message(httpd_req_t* req)
 static esp_err_t handle_test_push(httpd_req_t* req)
 {
     if (!check_auth(req)) return ESP_OK;
+    if (!ensure_get_or_post(req)) return ESP_OK;
     std::string action;
-    std::string ch_raw;
     get_query_param(req, "action", action);
-    get_query_param(req, "ch", ch_raw);
-    uint8_t ch = static_cast<uint8_t>(strtoul(ch_raw.c_str(), nullptr, 10));
-    httpd_resp_set_type(req, "application/json");
+    uint8_t ch = 0;
+    bool valid_channel = query_u8_range(req, "ch", IDF_MAX_PUSH_CHANNELS, ch);
+    set_json_no_cache(req);
+    if (!valid_channel) {
+        return httpd_resp_sendstr(req, "{\"success\":false,\"queued\":false,\"running\":false,\"message\":\"通道序号无效\"}");
+    }
     if (action == "status") {
         std::string body = idf_push_test_status_json(ch);
         return httpd_resp_send(req, body.c_str(), body.size());
+    }
+    if (req->method != HTTP_POST) {
+        return httpd_resp_sendstr(req, "{\"success\":false,\"queued\":false,\"running\":false,\"message\":\"测试推送需使用 POST\"}");
     }
 
     std::string msg;
@@ -1907,21 +2223,21 @@ static bool cereg_registered(const std::string& resp)
     std::string line = first_line_containing(resp, "+CEREG:");
     const char* p = strchr(line.c_str(), ':');
     if (!p) return false;
-    std::vector<int> nums;
-    while (*p) {
-        if (!isdigit(static_cast<unsigned char>(*p)) && *p != '-') {
-            ++p;
-            continue;
-        }
-        char* end = nullptr;
-        long v = strtol(p, &end, 10);
-        if (end == p) break;
-        nums.push_back(static_cast<int>(v));
-        p = end;
-        if (nums.size() >= 2) break;
+    std::string rest = p + 1;
+    size_t comma = rest.find(',');
+    int first = -1;
+    if (!parse_int_strict(rest.substr(0, comma), first)) return false;
+
+    int stat = first;
+    if (comma != std::string::npos) {
+        size_t second_end = rest.find(',', comma + 1);
+        std::string second = rest.substr(
+            comma + 1, second_end == std::string::npos ? std::string::npos : second_end - comma - 1);
+        int second_value = -1;
+        // 查询响应是 +CEREG: <n>,<stat>；URC 是 +CEREG: <stat>[,<tac>,...]。
+        // URC 的第二字段可能是带引号的 TAC，不能把解析失败当作整行无效。
+        if (parse_int_strict(second, second_value)) stat = second_value;
     }
-    if (nums.empty()) return false;
-    int stat = nums.size() >= 2 ? nums[1] : nums[0];
     return stat == 1 || stat == 5;
 }
 
@@ -2217,7 +2533,9 @@ static bool system_idle_for_maintenance()
 
 static bool cellular_job_active()
 {
-    bool active = false;
+    // 拿不到锁按"忙"处理(fail-safe)：该函数用于维护性重启前的空闲判断，
+    // 误判空闲会在 eSIM 切换/保号中途 esp_restart，设备可能停在错误的卡上
+    bool active = true;
     if (cell_job_lock()) {
         active = cellular_job_active_locked();
         cell_job_unlock();
@@ -2538,7 +2856,8 @@ static void scheduler_task(void*)
             int64_t day = local / 86400LL;
             if (local < 0 && (local % 86400LL) != 0) --day;
 
-            if (cfg.hbEnabled && hour == cfg.hbHour && day != hb_last_day) {
+            // 用 > 而非 !=：NTP 回拨跨过本地午夜会让 day 变小，!= 会当天重复触发
+            if (cfg.hbEnabled && hour == cfg.hbHour && day > hb_last_day) {
                 hb_last_day = day;
                 IdfSmsStatus sms = idf_sms_get_status();
                 char body[192];
@@ -2549,7 +2868,7 @@ static void scheduler_task(void*)
             }
 
             uint64_t uptime_ms = static_cast<uint64_t>(esp_timer_get_time() / 1000ULL);
-            if (cfg.rebootEnabled && hour == cfg.rebootHour && day != rb_last_day &&
+            if (cfg.rebootEnabled && hour == cfg.rebootHour && day > rb_last_day &&
                 uptime_ms >= 7200000ULL && system_idle_for_maintenance()) {
                 rb_last_day = day;
                 idf_log_line("每日定时重启...");
@@ -2566,10 +2885,10 @@ static void scheduler_task(void*)
 static esp_err_t handle_ping(httpd_req_t* req)
 {
     if (!check_auth(req)) return ESP_OK;
+    if (!ensure_get_or_post(req)) return ESP_OK;
     std::string action;
     get_query_param(req, "action", action);
-    httpd_resp_set_type(req, "application/json");
-    httpd_resp_set_hdr(req, "Cache-Control", "no-store, max-age=0");
+    set_json_no_cache(req);
 
     if (action == "status") {
         WebAsyncJob job;
@@ -2589,6 +2908,10 @@ static esp_err_t handle_ping(httpd_req_t* req)
         json_prop(body, "message", job.message);
         body += "}";
         return httpd_resp_send(req, body.c_str(), body.size());
+    }
+
+    if (req->method != HTTP_POST) {
+        return httpd_resp_sendstr(req, "{\"success\":false,\"message\":\"payload 下载需要 POST\"}");
     }
 
     std::string raw;
@@ -2624,7 +2947,9 @@ static esp_err_t handle_ping(httpd_req_t* req)
 
     PingTaskArg* arg = new (std::nothrow) PingTaskArg();
     if (!arg) {
-        if (cell_job_lock()) {
+        // 终态必须写进去(portMAX_DELAY)：300ms 拿锁失败就放弃的话,
+        // running 永远为 true，之后所有蜂窝任务被"任务正忙"挡到重启为止
+        if (cell_job_lock(portMAX_DELAY)) {
             s_ping_job.running = false;
             s_ping_job.queued = false;
             s_ping_job.done = true;
@@ -2638,7 +2963,7 @@ static esp_err_t handle_ping(httpd_req_t* req)
     arg->cellular = cellular_http_config(current.dataEnabled, current.apn);
     if (xTaskCreate(ping_task, "idf_ping_http", 6144, arg, 3, nullptr) != pdPASS) {
         delete arg;
-        if (cell_job_lock()) {
+        if (cell_job_lock(portMAX_DELAY)) {
             s_ping_job.running = false;
             s_ping_job.queued = false;
             s_ping_job.done = true;
@@ -2656,11 +2981,11 @@ static esp_err_t handle_ping(httpd_req_t* req)
 static esp_err_t handle_esim(httpd_req_t* req)
 {
     if (!check_auth(req)) return ESP_OK;
+    if (!ensure_get_or_post(req)) return ESP_OK;
     std::string action;
     get_query_param(req, "action", action);
     if (action.empty()) action = "status";
-    httpd_resp_set_type(req, "application/json");
-    httpd_resp_set_hdr(req, "Cache-Control", "no-store, max-age=0");
+    set_json_no_cache(req);
 
     if (action == "status") {
         WebAsyncJob job;
@@ -2744,15 +3069,15 @@ static esp_err_t handle_esim(httpd_req_t* req)
 static esp_err_t handle_keepalive(httpd_req_t* req)
 {
     if (!check_auth(req)) return ESP_OK;
+    if (!ensure_get_or_post(req)) return ESP_OK;
     std::string action;
     get_query_param(req, "action", action);
+    set_json_no_cache(req);
     if (action == "reset") {
         if (req->method != HTTP_POST) {
-            httpd_resp_set_type(req, "application/json");
             return httpd_resp_sendstr(req, "{\"success\":false,\"message\":\"该操作需要 POST\"}");
         }
         uint32_t now = static_cast<uint32_t>(time(nullptr));
-        httpd_resp_set_type(req, "application/json");
         if (now < 1700000000u) {
             // 时间未同步时写 0 会让 keepalive_due 立即判定"到期"，触发一次
             // 计划外的蜂窝流量/短信保号动作——拒绝而不是照单全收
@@ -2780,10 +3105,8 @@ static esp_err_t handle_keepalive(httpd_req_t* req)
     }
     if (action == "run") {
         if (req->method != HTTP_POST) {
-            httpd_resp_set_type(req, "application/json");
             return httpd_resp_sendstr(req, "{\"success\":false,\"message\":\"该操作需要 POST\"}");
         }
-        httpd_resp_set_type(req, "application/json");
         std::string message;
         bool already_running = false;
         IdfKeepaliveRunView run_cfg = idf_config_get_keepalive_run_view();
@@ -2857,17 +3180,16 @@ static esp_err_t handle_keepalive(httpd_req_t* req)
     json_prop(body, "jobMessage", job.message); body += ",";
     json_prop(body, "message", job.message);
     body += "}";
-    httpd_resp_set_type(req, "application/json");
     return httpd_resp_send(req, body.c_str(), body.size());
 }
 
 static esp_err_t handle_schedtask(httpd_req_t* req)
 {
     if (!check_auth(req)) return ESP_OK;
+    if (!ensure_get_or_post(req)) return ESP_OK;
     std::string action;
     get_query_param(req, "action", action);
-    httpd_resp_set_type(req, "application/json");
-    httpd_resp_set_hdr(req, "Cache-Control", "no-store, max-age=0");
+    set_json_no_cache(req);
 
     if (action == "run" || action == "reset") {
         // 变更类动作只收 POST：GET 可被预取/跨站链接静默触发切卡/发短信
@@ -2973,7 +3295,7 @@ static esp_err_t handle_schedtask(httpd_req_t* req)
 static esp_err_t handle_netled(httpd_req_t* req)
 {
     if (!check_auth(req)) return ESP_OK;
-    httpd_resp_set_type(req, "application/json");
+    set_json_no_cache(req);
     if (req->method != HTTP_POST) {
         return httpd_resp_sendstr(req, "{\"success\":false,\"message\":\"该操作需要 POST\"}");
     }
@@ -3002,7 +3324,7 @@ static esp_err_t handle_netled(httpd_req_t* req)
 static esp_err_t handle_ntp(httpd_req_t* req)
 {
     if (!check_auth(req)) return ESP_OK;
-    httpd_resp_set_type(req, "application/json");
+    set_json_no_cache(req);
     esp_err_t err = idf_wifi_resync_ntp();
     uint32_t now = static_cast<uint32_t>(time(nullptr));
     const IdfConfigStatusView cfg = idf_config_get_status_view();
@@ -3024,10 +3346,10 @@ static esp_err_t handle_reboot(httpd_req_t* req)
 {
     if (!check_auth(req)) return ESP_OK;
     idf_log_line("网页触发设备重启");
-    httpd_resp_set_type(req, "application/json");
-    httpd_resp_sendstr(req, "{\"success\":true,\"message\":\"设备即将重启\"}");
-    xTaskCreate(restart_task, "web_restart", 2048, nullptr, 1, nullptr);
-    return ESP_OK;
+    set_json_no_cache(req);
+    esp_err_t send_err = httpd_resp_sendstr(req, "{\"success\":true,\"message\":\"设备即将重启\"}");
+    schedule_restart_or_now("web_restart");
+    return send_err;
 }
 
 static esp_err_t handle_not_found(httpd_req_t* req)
@@ -3041,12 +3363,12 @@ static esp_err_t handle_not_found(httpd_req_t* req)
     return ESP_OK;
 }
 
-static esp_err_t register_handler(httpd_handle_t server, const char* uri, httpd_method_t method,
+static esp_err_t register_handler(httpd_handle_t server, const char* uri, int method,
                                   esp_err_t (*handler)(httpd_req_t*))
 {
     httpd_uri_t item = {};
     item.uri = uri;
-    item.method = method;
+    item.method = static_cast<httpd_method_t>(method);
     item.handler = handler;
     return httpd_register_uri_handler(server, &item);
 }
@@ -3062,16 +3384,21 @@ esp_err_t idf_web_start(void)
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.uri_match_fn = httpd_uri_match_wildcard;
     config.lru_purge_enable = true;
-    config.max_uri_handlers = 40;
+    // 多方法接口使用 HTTP_ANY 单路由，实际路由约 37 个；保留余量同时减少 HTTPD 路由表内存
+    config.max_uri_handlers = 48;
     config.stack_size = 8192;
-    // 浏览器单页会开 4~6 条并行连接，两个标签页就吃满默认 7 个 socket；
-    // 13 个可容纳两个活跃标签页 + 突发，配合 CONFIG_LWIP_MAX_SOCKETS=20
-    // (其余留给 mDNS/SNTP/推送/SMTP)。满员时 lru_purge 会踢最久未活动的
-    // 连接给新页面让位，所以上限本身不是硬墙，只影响并发流畅度
-    config.max_open_sockets = 13;
+    // HTTPD 内部预留 3 个 socket；此外本固件常驻 mDNS/DNS/SNTP，推送/SMTP
+    // 也需要余量。已有 build/sdkconfig 可能仍是旧值(如 LWIP=10)，硬设 13
+    // 会让 httpd_start 失败，设 7 又会在访问时 accept(ENFILE=23)。
+    int reserved_non_http_sockets = 3;
+    int http_socket_cap = CONFIG_LWIP_MAX_SOCKETS - 3 - reserved_non_http_sockets;
+    if (http_socket_cap < 2) http_socket_cap = 2;
+    int desired_http_sockets = 13;
+    config.max_open_sockets = desired_http_sockets < http_socket_cap ? desired_http_sockets : http_socket_cap;
+    ESP_LOGI(TAG, "HTTP sockets: open=%d, lwip=%d", config.max_open_sockets, CONFIG_LWIP_MAX_SOCKETS);
     // WiFi 掉线/标签页休眠留下的半开死连接靠 TCP keepalive 回收(约 24s)，
     // 否则它们占住 socket 只能等 LRU 被动淘汰
-    config.keep_alive_enable = true;
+    config.keep_alive_enable = CONFIG_LWIP_MAX_SOCKETS > 10;
     config.keep_alive_idle = 15;      // 空闲 15s 后开始探测
     config.keep_alive_interval = 3;   // 每 3s 一次
     config.keep_alive_count = 3;      // 3 次无响应即断开
@@ -3113,11 +3440,6 @@ esp_err_t idf_web_start(void)
     save.method = HTTP_POST;
     save.handler = handle_save;
 
-    httpd_uri_t wifi = {};
-    wifi.uri = "/wifi";
-    wifi.method = HTTP_GET;
-    wifi.handler = handle_wifi;
-
     httpd_uri_t wifi_scan = {};
     wifi_scan.uri = "/wifiscan";
     wifi_scan.method = HTTP_GET;
@@ -3138,55 +3460,15 @@ esp_err_t idf_web_start(void)
     log.method = HTTP_GET;
     log.handler = handle_empty_log;
 
-    httpd_uri_t keepalive = {};
-    keepalive.uri = "/keepalive";
-    keepalive.method = HTTP_GET;
-    keepalive.handler = handle_keepalive;
-
-    httpd_uri_t keepalive_post = {};
-    keepalive_post.uri = "/keepalive";
-    keepalive_post.method = HTTP_POST;
-    keepalive_post.handler = handle_keepalive;
-
     httpd_uri_t netled_post = {};
     netled_post.uri = "/netled";
     netled_post.method = HTTP_POST;
     netled_post.handler = handle_netled;
 
-    httpd_uri_t schedtask_get = {};
-    schedtask_get.uri = "/schedtask";
-    schedtask_get.method = HTTP_GET;
-    schedtask_get.handler = handle_schedtask;
-
-    httpd_uri_t schedtask_post = {};
-    schedtask_post.uri = "/schedtask";
-    schedtask_post.method = HTTP_POST;
-    schedtask_post.handler = handle_schedtask;
-
-    httpd_uri_t esim_get = {};
-    esim_get.uri = "/esim";
-    esim_get.method = HTTP_GET;
-    esim_get.handler = handle_esim;
-
-    httpd_uri_t esim_post = {};
-    esim_post.uri = "/esim";
-    esim_post.method = HTTP_POST;
-    esim_post.handler = handle_esim;
-
     httpd_uri_t reboot = {};
     reboot.uri = "/reboot";
     reboot.method = HTTP_POST;
     reboot.handler = handle_reboot;
-
-    httpd_uri_t pending_get = {};
-    pending_get.uri = "/at";
-    pending_get.method = HTTP_GET;
-    pending_get.handler = handle_at;
-
-    httpd_uri_t pending_post = {};
-    pending_post.uri = "/ping";
-    pending_post.method = HTTP_POST;
-    pending_post.handler = handle_ping;
 
     httpd_uri_t not_found = {};
     not_found.uri = "/*";
@@ -3216,27 +3498,23 @@ esp_err_t idf_web_start(void)
     IDF_WEB_TRY_REGISTER("/status", httpd_register_uri_handler(s_server, &status));
     IDF_WEB_TRY_REGISTER("/config.json", httpd_register_uri_handler(s_server, &config_json));
     IDF_WEB_TRY_REGISTER("/save", httpd_register_uri_handler(s_server, &save));
-    IDF_WEB_TRY_REGISTER("/wifi", httpd_register_uri_handler(s_server, &wifi));
+    IDF_WEB_TRY_REGISTER("/wifi", register_handler(s_server, "/wifi", HTTP_ANY, handle_wifi));
     IDF_WEB_TRY_REGISTER("/ntp", register_handler(s_server, "/ntp", HTTP_POST, handle_ntp));
     IDF_WEB_TRY_REGISTER("/wifiscan", httpd_register_uri_handler(s_server, &wifi_scan));
     IDF_WEB_TRY_REGISTER("/wificonfig", httpd_register_uri_handler(s_server, &wifi_config));
     IDF_WEB_TRY_REGISTER("/messages", httpd_register_uri_handler(s_server, &messages));
     IDF_WEB_TRY_REGISTER("/log", httpd_register_uri_handler(s_server, &log));
-    IDF_WEB_TRY_REGISTER("/keepalive", httpd_register_uri_handler(s_server, &keepalive));
-    IDF_WEB_TRY_REGISTER("/keepalive POST", httpd_register_uri_handler(s_server, &keepalive_post));
-    IDF_WEB_TRY_REGISTER("/esim GET", httpd_register_uri_handler(s_server, &esim_get));
-    IDF_WEB_TRY_REGISTER("/esim POST", httpd_register_uri_handler(s_server, &esim_post));
-    IDF_WEB_TRY_REGISTER("/schedtask GET", httpd_register_uri_handler(s_server, &schedtask_get));
-    IDF_WEB_TRY_REGISTER("/schedtask POST", httpd_register_uri_handler(s_server, &schedtask_post));
+    IDF_WEB_TRY_REGISTER("/keepalive", register_handler(s_server, "/keepalive", HTTP_ANY, handle_keepalive));
+    IDF_WEB_TRY_REGISTER("/esim", register_handler(s_server, "/esim", HTTP_ANY, handle_esim));
+    IDF_WEB_TRY_REGISTER("/schedtask", register_handler(s_server, "/schedtask", HTTP_ANY, handle_schedtask));
     IDF_WEB_TRY_REGISTER("/netled POST", httpd_register_uri_handler(s_server, &netled_post));
     IDF_WEB_TRY_REGISTER("/reboot", httpd_register_uri_handler(s_server, &reboot));
-    IDF_WEB_TRY_REGISTER("/at", httpd_register_uri_handler(s_server, &pending_get));
-    IDF_WEB_TRY_REGISTER("/ping", httpd_register_uri_handler(s_server, &pending_post));
-    IDF_WEB_TRY_REGISTER("/testpush GET", register_handler(s_server, "/testpush", HTTP_GET, handle_test_push));
-    IDF_WEB_TRY_REGISTER("/testpush POST", register_handler(s_server, "/testpush", HTTP_POST, handle_test_push));
-    IDF_WEB_TRY_REGISTER("/ussd", register_handler(s_server, "/ussd", HTTP_GET, handle_ussd));
-    IDF_WEB_TRY_REGISTER("/flight", register_handler(s_server, "/flight", HTTP_GET, handle_flight));
-    IDF_WEB_TRY_REGISTER("/modem", register_handler(s_server, "/modem", HTTP_GET, handle_modem_control));
+    IDF_WEB_TRY_REGISTER("/at", register_handler(s_server, "/at", HTTP_ANY, handle_at));
+    IDF_WEB_TRY_REGISTER("/ping", register_handler(s_server, "/ping", HTTP_ANY, handle_ping));
+    IDF_WEB_TRY_REGISTER("/testpush", register_handler(s_server, "/testpush", HTTP_ANY, handle_test_push));
+    IDF_WEB_TRY_REGISTER("/ussd", register_handler(s_server, "/ussd", HTTP_ANY, handle_ussd));
+    IDF_WEB_TRY_REGISTER("/flight", register_handler(s_server, "/flight", HTTP_ANY, handle_flight));
+    IDF_WEB_TRY_REGISTER("/modem", register_handler(s_server, "/modem", HTTP_ANY, handle_modem_control));
     IDF_WEB_TRY_REGISTER("/sendsms", register_handler(s_server, "/sendsms", HTTP_POST, handle_send_sms));
     IDF_WEB_TRY_REGISTER("/resend", register_handler(s_server, "/resend", HTTP_POST, handle_resend_message));
     IDF_WEB_TRY_REGISTER("/delete", register_handler(s_server, "/delete", HTTP_POST, handle_delete_message));
@@ -3245,6 +3523,9 @@ esp_err_t idf_web_start(void)
     IDF_WEB_TRY_REGISTER("/update", register_handler(s_server, "/update", HTTP_POST, handle_ota_update));
     IDF_WEB_TRY_REGISTER("/export", register_handler(s_server, "/export", HTTP_GET, handle_export_config));
     IDF_WEB_TRY_REGISTER("/logdownload", register_handler(s_server, "/logdownload", HTTP_GET, handle_log_download));
+    IDF_WEB_TRY_REGISTER("/prevlog", register_handler(s_server, "/prevlog", HTTP_GET, handle_prev_log));
+    IDF_WEB_TRY_REGISTER("/coredump", register_handler(s_server, "/coredump", HTTP_GET, handle_coredump_download));
+    IDF_WEB_TRY_REGISTER("/coredump/clear", register_handler(s_server, "/coredump/clear", HTTP_POST, handle_coredump_clear));
     IDF_WEB_TRY_REGISTER("/*", httpd_register_uri_handler(s_server, &not_found));
 
 #undef IDF_WEB_TRY_REGISTER
