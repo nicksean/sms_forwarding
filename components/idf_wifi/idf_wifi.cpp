@@ -58,9 +58,13 @@ static std::atomic<uint32_t> s_suppressed_beacon_logs{0};
 static std::atomic<bool> s_suppress_next_connect_log{false};
 static esp_timer_handle_t s_reconnect_timer = nullptr;
 static char s_ntp_server[128] = "ntp.aliyun.com";
+static esp_timer_handle_t s_ap_close_timer = nullptr;
+static std::atomic<bool> s_provisioning{false};  // 配网页触发的连接进行中：连上后延时关热点
+static constexpr uint32_t AP_PROVISION_HOLD_MS = 20000;  // 连上后保留热点让配网页显示 IP
 
 static esp_err_t start_provisioning_ap(bool manual = false);
 static void wifi_event_handler(void*, esp_event_base_t event_base, int32_t event_id, void* event_data);
+static void schedule_ap_close(uint32_t delay_ms);
 
 struct ApState {
     bool mode = false;
@@ -88,6 +92,35 @@ static void set_ap_state(bool mode, bool manual, const std::string& ssid)
         s_ap_ssid = ssid;
         xSemaphoreGive(s_state_mutex);
     }
+}
+
+// 配网连接成功后延时关闭热点：给配网页时间显示 IP，再切回纯 STA
+static void ap_close_timer_cb(void*)
+{
+    if (!ap_state_snapshot().mode) return;  // 已经关了
+    if (esp_wifi_set_mode(WIFI_MODE_STA) == ESP_OK) {
+        set_ap_state(false, false, std::string());
+        idf_log_line("配网热点已关闭，请改用设备 IP 或 http://sms.local 访问");
+    }
+}
+
+static void schedule_ap_close(uint32_t delay_ms)
+{
+    if (!s_ap_close_timer) {
+        const esp_timer_create_args_t targs = {
+            .callback = &ap_close_timer_cb,
+            .arg = nullptr,
+            .dispatch_method = ESP_TIMER_TASK,
+            .name = "ap_close",
+            .skip_unhandled_events = true,
+        };
+        if (esp_timer_create(&targs, &s_ap_close_timer) != ESP_OK) {
+            ap_close_timer_cb(nullptr);  // 创建失败退回立即关闭，避免卡在 AP
+            return;
+        }
+    }
+    esp_timer_stop(s_ap_close_timer);
+    esp_timer_start_once(s_ap_close_timer, static_cast<uint64_t>(delay_ms) * 1000ULL);
 }
 
 static bool sta_can_connect()
@@ -315,10 +348,17 @@ static void wifi_event_handler(void*, esp_event_base_t event_base, int32_t event
             xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
         }
         ApState ap = ap_state_snapshot();
-        if (ap.mode && !ap.manual && s_has_sta_credentials.load(std::memory_order_relaxed)) {
-            if (esp_wifi_set_mode(WIFI_MODE_STA) == ESP_OK) {
-                set_ap_state(false, false, std::string());
-                idf_log_line("STA 已恢复连接，已关闭配网热点");
+        if (ap.mode && s_has_sta_credentials.load(std::memory_order_relaxed)) {
+            if (s_provisioning.exchange(false, std::memory_order_relaxed)) {
+                // 配网页触发的连接成功：先留住热点让配网页显示 IP，再延时自动关闭
+                schedule_ap_close(AP_PROVISION_HOLD_MS);
+                idf_logf("配网连接成功，%lu 秒后自动关闭热点",
+                         static_cast<unsigned long>(AP_PROVISION_HOLD_MS / 1000));
+            } else if (!ap.manual) {
+                if (esp_wifi_set_mode(WIFI_MODE_STA) == ESP_OK) {
+                    set_ap_state(false, false, std::string());
+                    idf_log_line("STA 已恢复连接，已关闭配网热点");
+                }
             }
         }
     }
@@ -844,6 +884,31 @@ esp_err_t idf_wifi_reconnect(void)
     if (!sta_can_connect()) return ESP_ERR_INVALID_STATE;
     xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT);
     return esp_wifi_connect();
+}
+
+esp_err_t idf_wifi_provision_connect(const std::string& ssid, const std::string& pass)
+{
+    if (!s_started.load(std::memory_order_relaxed)) return ESP_ERR_INVALID_STATE;
+    wifi_config_t sta_config = {};
+    strlcpy(reinterpret_cast<char*>(sta_config.sta.ssid), ssid.c_str(), sizeof(sta_config.sta.ssid));
+    strlcpy(reinterpret_cast<char*>(sta_config.sta.password), pass.c_str(), sizeof(sta_config.sta.password));
+    sta_config.sta.scan_method = WIFI_FAST_SCAN;
+    sta_config.sta.sort_method = WIFI_CONNECT_AP_BY_SIGNAL;
+    sta_config.sta.threshold.authmode = WIFI_AUTH_OPEN;
+    // 保持 APSTA：配网页仍连在热点上，连上后由 IP 事件调度延时关热点(见 wifi_event_handler)
+    esp_err_t err = esp_wifi_set_mode(WIFI_MODE_APSTA);
+    if (err != ESP_OK) return err;
+    esp_wifi_disconnect();  // 断开可能存在的旧 STA 连接，确保按新凭据重连
+    err = esp_wifi_set_config(WIFI_IF_STA, &sta_config);
+    if (err != ESP_OK) return err;
+    s_has_sta_credentials.store(!ssid.empty(), std::memory_order_relaxed);
+    s_sta_configured.store(true, std::memory_order_relaxed);
+    s_provisioning.store(true, std::memory_order_relaxed);
+    if (s_wifi_event_group) xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT);
+    err = esp_wifi_connect();
+    ESP_LOGI(TAG, "配网：保存并连接 %s", ssid.c_str());
+    idf_logf("配网热点内保存 WiFi 并尝试连接: %s", ssid.c_str());
+    return err;
 }
 
 static void json_escape_append(std::string& out, const std::string& value)

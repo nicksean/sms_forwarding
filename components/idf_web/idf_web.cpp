@@ -188,18 +188,16 @@ static bool auth_matches_config(const char* auth)
     return idf_config_check_web_auth(reinterpret_cast<char*>(decoded), colon + 1);
 }
 
-// 配网热点模式下允许免认证访问的接口白名单：加载配网页面(SPA 与静态资源)、
-// 读取状态/配置(密码字段已脱敏)、扫描与提交 WiFi。仅覆盖"进入配网页并配好 WiFi"
-// 所需的最小集合。
+// 配网热点模式下允许免认证访问的接口白名单：只覆盖"进入独立配网页并配好 WiFi"
+// 所需的最小集合。刻意不放行 /ui、/status、/config.json、/assets 等——配网页是
+// 自包含的独立页面，不需要它们；不放行可避免开放热点期间暴露完整后台与已有配置。
 static bool is_ap_open_uri(const char* uri)
 {
     if (!uri) return false;
-    // 静态资源按前缀放行(/assets/app.js、/assets/app.css 等)
-    if (strncmp(uri, "/assets/", 8) == 0) return true;
-    // 其余按"路径"精确匹配，忽略 ?query
+    // 按"路径"精确匹配，忽略 ?query
     size_t path_len = strcspn(uri, "?");
     static const char* const kOpen[] = {
-        "/", "/ui", "/status", "/config.json", "/wifiscan", "/wificonfig",
+        "/", "/wifiscan", "/wificonfig", "/apstatus",
     };
     for (const char* p : kOpen) {
         if (strlen(p) == path_len && strncmp(uri, p, path_len) == 0) return true;
@@ -289,6 +287,10 @@ static esp_err_t send_gzip_asset(httpd_req_t* req, const WebAsset& asset, const 
 
 static esp_err_t handle_root(httpd_req_t* req)
 {
+    // 配网热点模式：只下发自包含的独立配网页(免密)，不加载完整后台，杜绝已有配置暴露
+    if (idf_wifi_is_ap_mode()) {
+        return send_gzip_asset(req, WEB_AP, "no-store, max-age=0");
+    }
     if (!check_auth(req)) return ESP_OK;
     return send_gzip_asset(req, WEB_INDEX, "no-store, max-age=0");
 }
@@ -1510,16 +1512,41 @@ static esp_err_t handle_wifi_config(httpd_req_t* req)
     IdfFormFields fields = parse_urlencoded(body);
     const std::string* ssid = find_field(fields, "ssid");
     const std::string* pass = find_field(fields, "pass");
-    esp_err_t err = idf_config_save_wifi(ssid ? *ssid : std::string(), pass ? *pass : std::string());
+    std::string ssid_s = ssid ? *ssid : std::string();
+    std::string pass_s = pass ? *pass : std::string();
+    esp_err_t err = idf_config_save_wifi(ssid_s, pass_s);
     set_json_no_cache(req);
     if (err != ESP_OK) {
         std::string msg = "{\"success\":false,\"message\":\"WiFi 配置无效\"}";
+        return httpd_resp_send(req, msg.c_str(), msg.size());
+    }
+    if (idf_wifi_is_ap_mode()) {
+        // 配网热点内：原地 APSTA 连接、不重启，配网页轮询 /apstatus 显示 IP，
+        // 连上后由设备延时自动关闭热点(见 idf_wifi_provision_connect)
+        idf_wifi_provision_connect(ssid_s, pass_s);
+        std::string msg = "{\"success\":true,\"message\":\"已保存，正在连接\"}";
         return httpd_resp_send(req, msg.c_str(), msg.size());
     }
     std::string msg = "{\"success\":true,\"message\":\"WiFi 已保存，设备即将重启\"}";
     esp_err_t send_err = httpd_resp_send(req, msg.c_str(), msg.size());
     schedule_restart_or_now("wifi_restart");
     return send_err;
+}
+
+// 配网专用极简状态：只回连接态与本机 STA IP，绝不包含任何已有配置
+static esp_err_t handle_apstatus(httpd_req_t* req)
+{
+    if (!check_auth(req)) return ESP_OK;  // AP 模式经白名单免密；STA 模式仍需登录
+    IdfWifiStatus wifi = idf_wifi_get_status();
+    set_json_no_cache(req);
+    std::string body = "{\"apMode\":";
+    body += wifi.apMode ? "true" : "false";
+    body += ",\"connected\":";
+    body += (wifi.staConnected && !wifi.ip.empty()) ? "true" : "false";
+    body += ",\"ip\":\"";
+    body += wifi.ip;
+    body += "\"}";
+    return httpd_resp_send(req, body.c_str(), body.size());
 }
 
 static esp_err_t handle_wifi(httpd_req_t* req)
@@ -3565,6 +3592,7 @@ esp_err_t idf_web_start(void)
     IDF_WEB_TRY_REGISTER("/ntp", register_handler(s_server, "/ntp", HTTP_POST, handle_ntp));
     IDF_WEB_TRY_REGISTER("/wifiscan", httpd_register_uri_handler(s_server, &wifi_scan));
     IDF_WEB_TRY_REGISTER("/wificonfig", httpd_register_uri_handler(s_server, &wifi_config));
+    IDF_WEB_TRY_REGISTER("/apstatus", register_handler(s_server, "/apstatus", HTTP_GET, handle_apstatus));
     IDF_WEB_TRY_REGISTER("/messages", httpd_register_uri_handler(s_server, &messages));
     IDF_WEB_TRY_REGISTER("/log", httpd_register_uri_handler(s_server, &log));
     IDF_WEB_TRY_REGISTER("/keepalive", register_handler(s_server, "/keepalive", HTTP_ANY, handle_keepalive));
