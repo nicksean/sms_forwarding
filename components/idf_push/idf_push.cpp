@@ -1570,7 +1570,6 @@ static bool process_forward_one()
     }
 
     const IdfPushForwardView cfg = idf_config_get_push_forward_view();
-    const std::string receiver = local_phone_number();
     ForwardDecision fd = eval_forward_rules(cfg.forwardRules, job.sender, job.text);
     if (fd.matched && fd.drop) {
         idf_logf("转发规则命中：丢弃短信 id=%u", static_cast<unsigned>(job.inboxId));
@@ -1582,6 +1581,9 @@ static bool process_forward_one()
     uint32_t mask = fd.matched ? fd.chMask : 0xFFFFFFFFu;
     bool email_selected = fd.matched ? fd.email : true;
     if (!cfg.pushEnabled) mask = 0;
+    // 本机号码只用于邮件正文；不走邮件时省掉一次模组状态查询(含互斥锁)
+    const std::string receiver = (email_selected && cfg.emailEnabled && cfg.emailConfigured)
+                                     ? local_phone_number() : std::string();
     int dispatched = 0;
     bool email_queued = false;
     bool enqueue_failed = false;
@@ -1781,7 +1783,9 @@ static bool process_email_one()
         if (s_mutex && xSemaphoreTake(s_mutex, portMAX_DELAY) == pdTRUE) {
             bool purged = false;
             for (auto& j : s_email_jobs) {
-                if (j.used) purged = true;
+                if (!j.used) continue;
+                purged = true;
+                // 邮件腿被丢弃：撤销完成计数，收件箱保持"未转发"以便手动重发
                 cancel_forward_completion_locked(j.completionId);
                 j = EmailJob();
             }
