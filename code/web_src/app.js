@@ -155,11 +155,12 @@
         ADMIN_PHONE: htmlEsc(c.adminPhone || ''), NUMBER_BLACK_LIST: htmlEsc(c.numberBlackList || ''), FORWARD_RULES: htmlEsc(c.forwardRules || ''),
         SMTP_CHECK: c.emailConfigured ? '已配置' : '未配置', EMAIL_EN: checked(c.emailEnabled), PUSH_EN: checked(c.pushEnabled),
         MODEM_CHECK: c.modemReady ? '已就绪' : '未就绪', PUSH_COUNT: String(c.pushEnabledCount || 0), INBOX_MAX: String(c.inboxMax || ''),
-        NTP: htmlEsc(c.ntpServer || ''), RB_CHECKED: checked(c.rebootEnabled), RB_HOUR: String(c.rebootHour == null ? 3 : c.rebootHour),
+        NTP: htmlEsc(c.ntpServer || ''), MDNS_HOST: htmlEsc(c.mdnsHost || 'sms'), RB_CHECKED: checked(c.rebootEnabled), RB_HOUR: String(c.rebootHour == null ? 3 : c.rebootHour),
         HB_CHECKED: checked(c.hbEnabled), HB_HOUR: String(c.hbHour == null ? 9 : c.hbHour), TZ_OPTIONS: buildTzOptions(c.tzOffsetMin),
         DATA_CHECKED: checked(c.dataEnabled), ROAMING_CHECKED: checked(c.roamingEnabled !== false),
         APN: htmlEsc(c.apn || ''), PHONE_NUMBER: htmlEsc(c.phoneNumber || ''),
         OPERATOR_PLMN: htmlEsc(c.operatorPlmn || ''), KA_PROFILE: htmlEsc(c.kaProfile || ''), PUSH_CHANNELS: buildPushChannels(c.pushChannels),
+        WIFI_NETWORKS: buildWifiNetworks(c.wifiNetworks),
         NETLED_CHECKED: checked(c.netLedEnabled !== false), CALLNOTIFY_CHECKED: checked(c.callNotifyEnabled !== false), UPTIME: htmlEsc(c.uptimeText || '')
       };
       return html.replace(/%([A-Z0-9_]{2,})%/g, function(m, k){ return Object.prototype.hasOwnProperty.call(map, k) ? map[k] : m; });
@@ -1598,20 +1599,27 @@
     }
 
     // ---- WiFi settings ----
-    function wifiScan() {
+    // 扫描结果统一回填上方配网下拉：无论扫描由“扫描”按钮还是历史列表聚焦触发
+    function wifiScanFillSelect(arr) {
       var sel = document.getElementById('wifiScanSel');
-      sel.innerHTML = '<option value="">扫描中（约 3 秒）...</option>';
-      fetch('/wifiscan?_=' + Date.now(), {cache:'no-store'}).then(jsonOrThrow).then(function(arr) {
-        if (!Array.isArray(arr) || !arr.length) { sel.innerHTML = '<option value="">未发现 WiFi</option>'; return; }
-        arr.sort(function(a, b){ return b.rssi - a.rssi; });
-        sel.innerHTML = '<option value="">选择网络（共 ' + arr.length + ' 个）</option>';
-        arr.forEach(function(w) {
-          var o = document.createElement('option');
-          o.value = w.ssid;
-          o.textContent = (w.ssid || '(隐藏网络)') + '  ·  ' + w.rssi + ' dBm  ·  ' + (w.enc ? '加密' : '开放');
-          sel.appendChild(o);
-        });
-      }).catch(function(){ sel.innerHTML = '<option value="">扫描失败</option>'; });
+      if (!sel) return;
+      if (!arr.length) { sel.innerHTML = '<option value="">未发现 WiFi</option>'; return; }
+      sel.innerHTML = '<option value="">选择网络（共 ' + arr.length + ' 个）</option>';
+      arr.forEach(function(w) {
+        var o = document.createElement('option');
+        o.value = w.ssid;
+        o.textContent = (w.ssid || '(隐藏网络)') + '  ·  ' + w.rssi + ' dBm  ·  ' + (w.enc ? '加密' : '开放');
+        sel.appendChild(o);
+      });
+    }
+    function wifiScan() {  // 两张卡的“扫描”按钮共用：强制重扫并同步刷新两处下拉
+      var sel = document.getElementById('wifiScanSel');
+      if (sel) sel.innerHTML = '<option value="">扫描中（约 3 秒）...</option>';
+      wifiScanCache = null;
+      wifiScanReq = null;
+      wifiSuggestFetch().catch(function() {
+        if (sel) sel.innerHTML = '<option value="">扫描失败</option>';
+      });
     }
     function wifiPick() {
       var v = document.getElementById('wifiScanSel').value;
@@ -1633,6 +1641,80 @@
         var ssidIn = document.getElementById('wifiSsidIn');
         if (ssidIn && d.ssid && !d.apMode && !ssidIn.value) ssidIn.value = d.ssid;
       }).catch(function(){});
+    }
+    function buildWifiNetworks(nets) {
+      nets = nets || [];
+      var html = '';
+      for (var i = 0; i < 5; i++) {
+        var n = nets[i] || {};
+        var has = !!n.ssid;
+        html += '<div class="form-group"><label class="form-label">网络 ' + (i + 1) + (i === 0 ? '（最近配网）' : '') + '</label>';
+        html += '<div style="display:flex;gap:6px;align-items:center;">';
+        html += '<div class="wifi-suggest-wrap">';
+        html += '<input class="form-input" type="text" name="wifi' + i + 'Ssid" id="wifiNetSsid' + i + '" value="' + htmlEsc(n.ssid || '') + '" placeholder="SSID（留空 = 未使用）" maxlength="32" autocomplete="off" onfocus="wifiSuggestOpen(' + i + ')" oninput="wifiSuggestOpen(' + i + ')" onblur="wifiSuggestClose(' + i + ')">';
+        html += '<div class="wifi-suggest" id="wifiSuggest' + i + '" style="display:none;"></div></div>';
+        html += '<button type="button" class="btn btn-secondary btn-sm" onclick="wifiNetClear(' + i + ')">删除</button></div>';
+        html += '<input class="form-input" type="password" name="wifi' + i + 'Pass" id="wifiNetPass' + i + '" value="" placeholder="' + (n.passSet ? '留空保持原密码' : (has ? '开放网络（无密码）' : '密码')) + '" maxlength="64" style="margin-top:4px;">';
+        html += '</div>';
+      }
+      return html;
+    }
+    function wifiNetClear(i) {
+      var s = document.getElementById('wifiNetSsid' + i), p = document.getElementById('wifiNetPass' + i);
+      if (s) s.value = '';
+      if (p) { p.value = ''; p.placeholder = '密码'; }
+    }
+    // SSID 扫描候选：首次聚焦自动扫描一次并缓存，点“扫描”按钮会刷新缓存
+    var wifiScanCache = null, wifiScanReq = null;
+    function wifiSuggestFetch() {
+      if (wifiScanCache) return Promise.resolve(wifiScanCache);
+      if (!wifiScanReq) {
+        wifiScanReq = fetch('/wifiscan?_=' + Date.now(), {cache:'no-store'}).then(jsonOrThrow).then(function(arr) {
+          arr = Array.isArray(arr) ? arr : [];
+          arr.sort(function(a, b){ return b.rssi - a.rssi; });
+          wifiScanCache = arr;
+          wifiScanFillSelect(arr);  // 任何来源的扫描都同步回填上方配网下拉
+          return arr;
+        }).catch(function(e){ wifiScanReq = null; throw e; });
+      }
+      return wifiScanReq;
+    }
+    function wifiSuggestOpen(i) {
+      var box = document.getElementById('wifiSuggest' + i);
+      var inp = document.getElementById('wifiNetSsid' + i);
+      if (!box || !inp) return;
+      box.style.display = 'block';
+      if (!wifiScanCache) box.innerHTML = '<div class="wifi-suggest-empty">扫描中（约 3 秒）...</div>';
+      wifiSuggestFetch().then(function(arr) {
+        if (box.style.display === 'none') return;   // 等待期间已失焦
+        var q = (inp.value || '').toLowerCase();
+        var items = arr.filter(function(w){ return w.ssid && (!q || w.ssid.toLowerCase().indexOf(q) >= 0); });
+        box.innerHTML = '';
+        if (!items.length) {
+          box.innerHTML = '<div class="wifi-suggest-empty">' + (arr.length ? '无匹配网络' : '未发现 WiFi') + '</div>';
+          return;
+        }
+        items.forEach(function(w) {
+          var d = document.createElement('div');
+          d.className = 'wifi-suggest-item';
+          var name = document.createElement('span'); name.textContent = w.ssid;
+          var meta = document.createElement('span'); meta.className = 'ws-meta';
+          meta.textContent = w.rssi + ' dBm · ' + (w.enc ? '加密' : '开放');
+          d.appendChild(name); d.appendChild(meta);
+          d.addEventListener('mousedown', function(e) {  // mousedown 先于 blur，选中不会被关闭吞掉
+            e.preventDefault();
+            inp.value = w.ssid;
+            box.style.display = 'none';
+          });
+          box.appendChild(d);
+        });
+      }).catch(function() {
+        if (box.style.display !== 'none') box.innerHTML = '<div class="wifi-suggest-empty">扫描失败，请点“扫描”重试</div>';
+      });
+    }
+    function wifiSuggestClose(i) {
+      var box = document.getElementById('wifiSuggest' + i);
+      if (box) box.style.display = 'none';
     }
 
     // ---- Config backup / OTA ----

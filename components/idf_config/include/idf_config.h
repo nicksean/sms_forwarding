@@ -16,6 +16,15 @@ static constexpr const char* IDF_KEEPALIVE_DEFAULT_URL = "http://gg.incrafttime.
 
 static constexpr int IDF_MAX_SCHED_TASKS = 6;
 
+// 历史 WiFi 列表：连接前先扫描，与列表匹配后直连在场且信号最好的一组(取代固定
+// 主备槽位的顺序盲试)。槽位 0 为最近一次配网保存的网络，兼容旧版单组配置。
+static constexpr int IDF_MAX_WIFI_NETWORKS = 5;
+
+struct IdfWifiNetwork {
+    std::string ssid;
+    std::string pass;
+};
+
 // 进阶定时任务：可选定目标 eSIM Profile，每 N 天执行一个动作，完成后可切回原卡
 struct IdfSchedTask {
     bool enabled = false;
@@ -40,8 +49,9 @@ struct IdfPushChannel {
 };
 
 struct IdfConfig {
-    std::string wifiSsid;
-    std::string wifiPass;
+    // 槽位 0 持久化在旧键 wifiSsid/wifiPass 上，其余在 wifiNSsid/wifiNPass，
+    // OTA 回滚到旧固件仍能读到最近配网的网络
+    IdfWifiNetwork wifiNetworks[IDF_MAX_WIFI_NETWORKS];
     bool wifiFromFallback = false;
 
     std::string smtpServer;
@@ -68,6 +78,7 @@ struct IdfConfig {
 
     int tzOffsetMin = 480;
     std::string ntpServer = "ntp.aliyun.com";
+    std::string mdnsHost = "sms";  // mDNS 主机名(<host>.local)，多设备部署可改名避免互相顶替
     bool rebootEnabled = false;
     int rebootHour = 4;
     bool hbEnabled = false;
@@ -89,9 +100,18 @@ using IdfFormFields = std::vector<std::pair<std::string, std::string>>;
 
 esp_err_t idf_config_load(void);
 esp_err_t idf_config_save(void);
+// 配网保存：同名更新密码并提到槽位 0，新网络插入槽位 0，满员挤掉最旧一组
 esp_err_t idf_config_save_wifi(const std::string& ssid, const std::string& pass);
+// 网页整表保存历史 WiFi 列表；preserve_blank_pass=true 时已存网络密码留空表示不修改
+esp_err_t idf_config_save_wifi_networks(const IdfWifiNetwork nets[IDF_MAX_WIFI_NETWORKS],
+                                        bool preserve_blank_pass);
+// 类手机行为：STA 连接成功后记住当前网络并维持"最近使用"序(LRU)：
+// 已在首位直接返回(常驻网络重连零开销)；在列表但不在首位提到首位；
+// 新网络/密码变更上位插入，满员挤掉末位(最久未用)的一组
+esp_err_t idf_config_note_wifi_connected(const std::string& ssid, const std::string& pass);
 esp_err_t idf_config_save_account(const std::string& user, const std::string& pass);
 esp_err_t idf_config_save_time(int tz_offset_min, const std::string& ntp_server);
+esp_err_t idf_config_save_mdns_host(const std::string& host);
 esp_err_t idf_config_save_email(bool enabled, const std::string& server, int port,
                                 const std::string& user, const std::string& pass,
                                 const std::string& send_to, bool preserve_blank_pass);
@@ -131,6 +151,12 @@ struct IdfConfigStatusView {
     std::string apn;
 };
 
+// 历史 WiFi 的网页视图：只带 SSID 与"密码已设置"标记，密码明文不出配置组件
+struct IdfWifiNetworkView {
+    std::string ssid;
+    bool passSet = false;
+};
+
 // /config.json 专用快照：不带定时任务数组，避免面板切换/保存后刷新时全量深拷贝
 struct IdfConfigWebView {
     std::string webUser = IDF_DEFAULT_WEB_USER;
@@ -148,6 +174,7 @@ struct IdfConfigWebView {
     bool pushEnabled = true;
     int pushEnabledCount = 0;
     std::string ntpServer = "ntp.aliyun.com";
+    std::string mdnsHost = "sms";
     int tzOffsetMin = 480;
     bool rebootEnabled = false;
     int rebootHour = 4;
@@ -161,6 +188,7 @@ struct IdfConfigWebView {
     std::string kaProfile;
     bool netLedEnabled = true;
     bool callNotifyEnabled = true;
+    IdfWifiNetworkView wifiNetworks[IDF_MAX_WIFI_NETWORKS];
     IdfPushChannel pushChannels[IDF_MAX_PUSH_CHANNELS];
 };
 
@@ -285,3 +313,10 @@ bool idf_config_call_notify_enabled(void);
 // 避免深拷贝整个 IdfConfig 到小栈上导致爆栈
 int idf_config_get_tz_offset(void);
 std::string idf_config_get_ntp_server(void);
+// mDNS 主机名窄访问器：应答任务(3KB 栈)每秒节拍轮询，写入定长缓冲，
+// 既避免全量配置深拷贝又避免每秒一次 std::string 堆分配
+void idf_config_copy_mdns_host(char* out, size_t cap);
+// 历史 WiFi 访问器：选网任务取列表(只含非空槽位)；计数器给 15s 重连看门狗
+// (esp_timer 任务)判断是否需要扫描选网，锁内只数个数
+std::vector<IdfWifiNetwork> idf_config_get_wifi_networks(void);
+int idf_config_wifi_network_count(void);

@@ -556,6 +556,7 @@ static esp_err_t send_config_json(httpd_req_t* req)
               idf_modem_get_status().modemReady ? "true" : "false");
     body += buf;
     json_prop(body, "ntpServer", cfg.ntpServer); body += ",";
+    json_prop(body, "mdnsHost", cfg.mdnsHost); body += ",";
     snprintf(buf, sizeof(buf),
              "\"tzOffsetMin\":%d,\"rebootEnabled\":%s,\"rebootHour\":%d,"
              "\"hbEnabled\":%s,\"hbHour\":%d,\"dataEnabled\":%s,\"roamingEnabled\":%s,",
@@ -575,6 +576,16 @@ static esp_err_t send_config_json(httpd_req_t* req)
     body += "\"callNotifyEnabled\":";
     body += cfg.callNotifyEnabled ? "true" : "false";
     body += ",";
+    body += "\"wifiNetworks\":[";
+    for (int i = 0; i < IDF_MAX_WIFI_NETWORKS; ++i) {
+        if (i) body += ",";
+        body += "{";
+        json_prop(body, "ssid", cfg.wifiNetworks[i].ssid);
+        body += ",\"passSet\":";
+        body += cfg.wifiNetworks[i].passSet ? "true" : "false";
+        body += "}";
+    }
+    body += "],";
     body += "\"pushChannels\":[";
     for (int i = 0; i < IDF_MAX_PUSH_CHANNELS; ++i) {
         if (i) body += ",";
@@ -1325,12 +1336,15 @@ static esp_err_t handle_save(httpd_req_t* req)
     const bool system_sched_form = has_field(fields, "systemSchedForm");
     const bool sim_form = has_field(fields, "simForm");
     const bool call_form = has_field(fields, "callForm");
+    const bool mdns_form = has_field(fields, "mdnsForm");
+    const bool wifi_list_form = has_field(fields, "wifiListForm");
     const int form_count = (account_form ? 1 : 0) + (tz_form ? 1 : 0) +
                            (led_form ? 1 : 0) + (email_form ? 1 : 0) +
                            (push_form ? 1 : 0) + (filter_form ? 1 : 0) +
                            (rules_form ? 1 : 0) + (ka_form ? 1 : 0) +
                            (st_form ? 1 : 0) + (system_sched_form ? 1 : 0) +
-                           (sim_form ? 1 : 0) + (call_form ? 1 : 0);
+                           (sim_form ? 1 : 0) + (call_form ? 1 : 0) +
+                           (mdns_form ? 1 : 0) + (wifi_list_form ? 1 : 0);
     if (form_count != 1) {
         idf_log_line(form_count == 0 ? "网页保存请求缺少表单标记，已忽略"
                                      : "网页保存请求包含多个表单标记，已拒绝");
@@ -1365,6 +1379,36 @@ static esp_err_t handle_save(httpd_req_t* req)
                                              field_text(fields, "ntpServer"));
         if (err != ESP_OK) return fail(err);
         return ok("网页保存时间设置");
+    }
+
+    if (mdns_form) {
+        // 规范化(转小写/剥离 .local/过滤非法字符)在 idf_config_save_mdns_host 内完成，
+        // 保存成功后 mDNS 应答任务 ≤1s 切换到新主机名，无需重启
+        esp_err_t err = idf_config_save_mdns_host(field_text(fields, "mdnsHost"));
+        if (err != ESP_OK) return fail(err);
+        return ok("网页保存 mDNS 主机名");
+    }
+
+    if (wifi_list_form) {
+        // 历史 WiFi 整表保存：空 SSID 行=删除该槽位；已存网络密码留空=保持原密码。
+        // 只改列表不打断当前连接，掉线重连/重启后按新列表扫描选网
+        IdfWifiNetwork nets[IDF_MAX_WIFI_NETWORKS];
+        for (int i = 0; i < IDF_MAX_WIFI_NETWORKS; ++i) {
+            char key[16];
+            snprintf(key, sizeof(key), "wifi%dSsid", i);
+            nets[i].ssid = field_text(fields, key);
+            snprintf(key, sizeof(key), "wifi%dPass", i);
+            nets[i].pass = field_text(fields, key);
+        }
+        esp_err_t err = idf_config_save_wifi_networks(nets, true);
+        if (err == ESP_ERR_INVALID_ARG) {
+            set_no_cache_headers(req);
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                                "SSID 最长 32 字节、密码最长 64 字节");
+            return ESP_OK;
+        }
+        if (err != ESP_OK) return fail(err);
+        return ok("网页保存 WiFi 网络列表");
     }
 
     if (led_form) {
